@@ -14,13 +14,16 @@
 # limitations under the License.
 """Utilities for generating builder scripts for a GitHub repository."""
 
+import logging
 import os
 import shutil
 import subprocess
 from abc import abstractmethod
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import manager
+
+logger = logging.getLogger(name=__name__)
 
 
 ############################################################
@@ -31,6 +34,19 @@ class AutoBuildContainer:
   def __init__(self):
     self.list_of_commands = []
     self.heuristic_id = ''
+
+
+class BuildWorker:
+  """Keeper of data on auto generated builds."""
+
+  def __init__(self, build_suggestion: AutoBuildContainer, build_script: str,
+               build_directory: str, executable_files_build: Dict[str,
+                                                                  List[str]]):
+    self.build_suggestion: AutoBuildContainer = build_suggestion
+    self.build_script: str = build_script
+    self.build_directory: str = build_directory
+    self.executable_files_build: Dict[str, List[str]] = executable_files_build
+    self.base_fuzz_build: bool = False
 
 
 class AutoBuildBase:
@@ -59,6 +75,53 @@ class AutoBuildBase:
     return False
 
 
+class HeaderOnlyCBuilder(AutoBuildBase):
+  """Wrapper for building header-only targets"""
+
+  def __init__(self):
+    super().__init__()
+    self.matches_found = {'.h': []}
+
+  def match_files(self, file_list):
+    """Matches files needed for the build heuristic."""
+    file_dicts = {
+        '.c': [],
+        '.h': [],
+    }
+    for fi in file_list:
+      for key, val in file_dicts.items():
+        if fi.endswith(key) and 'test' not in fi and 'example' not in fi:
+          # Remove the first folder as that is "this" dir.
+          path_to_add = '/'.join(fi.split('/')[1:])
+          val.append(path_to_add)
+    if not file_dicts['.c'] and file_dicts['.h']:
+      self.matches_found['.h'] = file_dicts['.h']
+
+  def steps_to_build(self) -> Iterator[AutoBuildContainer]:
+    build_container = AutoBuildContainer()
+
+    header_writers = ''
+    for header_file in self.matches_found['.h']:
+      header_writers += f'echo "#include \\"{header_file}\\"" >> empty_wrapper.c\n'
+
+    build_container.list_of_commands = [
+        f'''touch empty_wrapper.c
+# Write includes for each of the header files
+{header_writers}
+rm -rf *.o
+$CC $CFLAGS -c empty_wrapper.c -o empty_wrapper.o
+llvm-ar rcs libfuzz.a *.o
+'''
+    ]
+    build_container.heuristic_id = self.name + '1'
+    logger.info(build_container.list_of_commands[0])
+    yield build_container
+
+  @property
+  def name(self):
+    return 'HeaderOnlyCBuilder'
+
+
 class PureCFileCompiler(AutoBuildBase):
   """Builder for compiling .c files direcetly in root repo dir."""
 
@@ -73,7 +136,7 @@ class PureCFileCompiler(AutoBuildBase):
     for fi in file_list:
       for key, val in self.matches_found.items():
         if fi.endswith(key) and 'test' not in fi and 'example' not in fi:
-          print('Adding %s' % (fi))
+          logger.info('Adding %s', fi)
           # Remove the first folder as that is "this" dir.
           path_to_add = '/'.join(fi.split('/')[1:])
           val.append(path_to_add)
@@ -90,7 +153,7 @@ llvm-ar rcs libfuzz.a *.o
 ''' % (' '.join(self.matches_found['.c']))
     ]
     build_container.heuristic_id = self.name + '1'
-    print(build_container.list_of_commands[0])
+    logger.info(build_container.list_of_commands[0])
     yield build_container
 
   @property
@@ -451,9 +514,9 @@ class CMakeScannerOptsParser(AutoBuildBase):
       if option['type'] != 'BOOL':
         continue
       if 'STATIC' in option['name'] and option['default'] != 'ON':
-        cmake_string += '-D%s=ON ' % (option['name'])
+        cmake_string += f'-D{option["name"]}=ON '
       elif option['default'] != 'OFF':
-        cmake_string += '-D%s=OFF ' % (option['name'])
+        cmake_string += f'-D{option["name"]}=OFF '
     return cmake_string
 
 
@@ -483,9 +546,9 @@ class CMakeScanner(AutoBuildBase):
               self.cmake_options.add(option)
 
     if len(self.cmake_options) > 0:
-      print('Options:')
+      logger.info('Options:')
       for option in self.cmake_options:
-        print('%s' % (option))
+        logger.info('%s', option)
 
   def steps_to_build(self):
     # When we are running this, we are confident there are
@@ -513,7 +576,7 @@ class CMakeScanner(AutoBuildBase):
     opt1 = [
         'mkdir fuzz-build',
         'cd fuzz-build',
-        'cmake %s ../' % (' '.join(cmake_opts)),
+        f'cmake {" ".join(cmake_opts)} ../',
         'make V=1 || true',
     ]
     build_container2 = AutoBuildContainer()
@@ -525,7 +588,7 @@ class CMakeScanner(AutoBuildBase):
     opt_static = [
         'mkdir fuzz-build',
         'cd fuzz-build',
-        'cmake %s ../' % (' '.join(cmake_opts)),
+        f'cmake {" ".join(cmake_opts)} ../',
         'sed -i \'s/SHARED/STATIC/g\' ../CMakeLists.txt',
         'make V=1 || true',
     ]
@@ -538,13 +601,13 @@ class CMakeScanner(AutoBuildBase):
     option_values = []
     for option in self.cmake_options:
       if 'BUILD_SHARED_LIBS' == option:
-        option_values.append('-D%s=OFF' % (option))
+        option_values.append(f'-D{option}=OFF')
       elif 'BUILD_STATIC' == option:
-        option_values.append('-D%s=ON' % (option))
+        option_values.append(f'-D{option}=ON')
       elif 'BUILD_SHARED' == option:
-        option_values.append('-D%s=OFF' % (option))
+        option_values.append(f'-D{option}=OFF')
       elif 'ENABLE_STATIC' == option:
-        option_values.append('-D%s=ON' % (option))
+        option_values.append(f'-D{option}=ON')
 
     if len(option_values) > 0:
       option_string = ' '.join(option_values)
@@ -555,7 +618,7 @@ class CMakeScanner(AutoBuildBase):
       bopt = [
           'mkdir fuzz-build',
           'cd fuzz-build',
-          'cmake %s %s ../' % (' '.join(cmake_default_options), option_string),
+          f'cmake {" ".join(cmake_default_options)} {option_string} ../',
           'make V=1',
       ]
       build_container3 = AutoBuildContainer()
@@ -568,15 +631,15 @@ class CMakeScanner(AutoBuildBase):
     option_values = []
     for option in self.cmake_options:
       if 'BUILD_SHARED_LIBS' == option:
-        option_values.append('-D%s=OFF' % (option))
+        option_values.append(f'-D{option}=OFF')
       elif 'BUILD_STATIC' == option:
-        option_values.append('-D%s=ON' % (option))
+        option_values.append(f'-D{option}=ON')
       elif 'BUILD_SHARED' == option:
-        option_values.append('-D%s=OFF' % (option))
+        option_values.append(f'-D{option}=OFF')
       elif 'ENABLE_STATIC' == option:
-        option_values.append('-D%s=ON' % (option))
+        option_values.append(f'-D{option}=ON')
       elif 'BUILD_TESTS' in option:
-        option_values.append('-D%s=ON' % (option))
+        option_values.append(f'-D{option}=ON')
 
     if len(option_values) > 0:
       option_string = ' '.join(option_values)
@@ -587,7 +650,7 @@ class CMakeScanner(AutoBuildBase):
       bopt = [
           'mkdir fuzz-build',
           'cd fuzz-build',
-          'cmake %s %s ../' % (' '.join(cmake_default_options), option_string),
+          f'cmake {" ".join(cmake_default_options)} {option_string} ../',
           'make V=1',
       ]
       build_container4 = AutoBuildContainer()
@@ -621,12 +684,27 @@ def match_build_heuristics_on_folder(abspath_of_target: str):
       RawMake(),
       BootstrapScanner(),
       AutogenScannerSH(),
+      HeaderOnlyCBuilder(),
   ]
 
-  for scanner in all_checks:
+  checks_to_test = []
+
+  logger.info('Filtering out build scripts')
+  build_heuristics_to_analyse = os.getenv('BUILD_HEURISTICS', 'all')
+  if build_heuristics_to_analyse == 'all':
+    checks_to_test = all_checks
+  else:
+    all_build_heuristics = build_heuristics_to_analyse.split(',')
+    for name in all_build_heuristics:
+      for check in all_checks:
+        if check.name == name:
+          checks_to_test.append(check)
+
+  logger.info('Using %d checks.', len(checks_to_test))
+  for scanner in checks_to_test:
     scanner.match_files(all_files)
     if scanner.is_matched():
-      print('Matched: %s' % (scanner.name))
+      logger.info('Matched: %s', scanner.name)
       for auto_build_gen in scanner.steps_to_build():
         yield auto_build_gen
 
@@ -649,9 +727,9 @@ def get_all_binary_files_from_folder(path: str) -> Dict[str, List[str]]:
 def wrap_build_script(test_dir: str, build_container: AutoBuildContainer,
                       abspath_of_target: str) -> str:
   build_script = '#!/bin/bash\n'
-  build_script += 'rm -rf /%s\n' % (test_dir)
-  build_script += 'cp -rf %s %s\n' % (abspath_of_target, test_dir)
-  build_script += 'cd %s\n' % (test_dir)
+  build_script += f'rm -rf /{test_dir}\n'
+  build_script += f'cp -rf {abspath_of_target} {test_dir}\n'
+  build_script += f'cd {test_dir}\n'
   for cmd in build_container.list_of_commands:
     build_script += cmd + '\n'
 
@@ -678,10 +756,10 @@ def extract_build_suggestions(
   # Get all of the build heuristics
   all_build_suggestions: List[AutoBuildContainer] = list(
       match_build_heuristics_on_folder(target_dir))
-  print('Found %d possible build suggestions' % (len(all_build_suggestions)))
+  logger.info('Found %d possible build suggestions', len(all_build_suggestions))
   #all_build_suggestions = all_build_suggestions[:2]
   for build_suggestion in all_build_suggestions:
-    print(f'- {build_suggestion.heuristic_id}')
+    logger.info('- %s', build_suggestion.heuristic_id)
 
   # Convert the build heuristics into build scripts
   all_build_scripts = convert_build_heuristics_to_scripts(
@@ -690,12 +768,12 @@ def extract_build_suggestions(
 
 
 def raw_build_evaluation(
-    all_build_scripts: List[Tuple[str, str, AutoBuildContainer]],
-    initial_executable_files: Dict[str, List[str]]) -> Dict[str, Any]:
+    all_build_scripts: List[Tuple[str, str, AutoBuildContainer]]
+) -> Dict[str, BuildWorker]:
   """Run each of the build scripts and extract any artifacts build by them."""
   build_results = {}
   for build_script, test_dir, build_suggestion in all_build_scripts:
-    print(f'Evaluating build heuristic {build_suggestion.heuristic_id}')
+    logger.info('Evaluating build heuristic %s', build_suggestion.heuristic_id)
     with open('/src/build.sh', 'w') as bf:
       bf.write(build_script)
     try:
@@ -710,21 +788,9 @@ def raw_build_evaluation(
     # to running the build.
     binary_files_build = get_all_binary_files_from_folder(test_dir)
 
-    new_binary_files = {
-        'static-libs': [],
-        'dynamic-libs': [],
-        'object-files': []
-    }
-    for key, bfiles in binary_files_build.items():
-      for bfile in bfiles:
-        if bfile not in initial_executable_files[key]:
-          new_binary_files[key].append(bfile)
+    build_worker = BuildWorker(build_suggestion, build_script, test_dir,
+                               binary_files_build)
 
-    print(f'Static libs found {new_binary_files}')
-    # binary_files_build['static-libs'])
-    build_results[test_dir] = {
-        'build-script': build_script,
-        'executables-build': binary_files_build,
-        'auto-build-setup': (build_script, test_dir, build_suggestion)
-    }
+    build_results[test_dir] = build_worker
+
   return build_results

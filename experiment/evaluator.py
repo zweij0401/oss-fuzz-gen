@@ -16,6 +16,7 @@ LLM-generated project Evaluator.
 """
 import dataclasses
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,11 +29,16 @@ from experiment.benchmark import Benchmark
 from experiment.builder_runner import BuildResult, RunResult
 from experiment.fuzz_target_error import SemanticCheckResult
 from experiment.workdir import WorkDirs
-from llm_toolkit import code_fixer
+from llm_toolkit import code_fixer, corpus_generator, crash_triager
+from llm_toolkit.crash_triager import TriageResult
+
+logger = logging.getLogger(__name__)
 
 LLM_FIX_LIMIT = int(os.getenv('LLM_FIX_LIMIT', '5'))
+GENERATE_CORPUS = bool(os.getenv('LLM_GENERATE_CORPUS', ''))
 
 OSS_FUZZ_COVERAGE_BUCKET = 'oss-fuzz-coverage'
+OSS_FUZZ_INTROSPECTOR_BUCKET = 'oss-fuzz-introspector'
 
 
 @dataclasses.dataclass
@@ -47,6 +53,9 @@ class Result:
   # Grammatically correct but has false positive or no cov increase at all.
   is_semantic_error: bool = False
   semantic_error: str = ''
+  triage: str = ''
+  textcov_diff: textcov.Textcov = dataclasses.field(
+      default_factory=textcov.Textcov)
   # Deprecated renamed fields. Keeping them for backward compatibility.
   # TODO https://github.com/google/oss-fuzz-gen/issues/215
   is_driver_fuzz_err: bool = dataclasses.field(kw_only=True, default=False)
@@ -58,12 +67,11 @@ class Result:
     if self.driver_fuzz_err:
       self.semantic_error = self.driver_fuzz_err
 
-  def dict(self):
+  def to_dict(self):
     return dataclasses.asdict(self)
 
 
-def load_existing_textcov(project: str,
-                          language: str = 'c++') -> textcov.Textcov:
+def load_existing_textcov(project: str) -> textcov.Textcov:
   """Loads existing textcovs."""
   storage_client = storage.Client.create_anonymous_client()
   bucket = storage_client.bucket(OSS_FUZZ_COVERAGE_BUCKET)
@@ -76,7 +84,8 @@ def load_existing_textcov(project: str,
 
   if not blobs.prefixes:  # type: ignore
     # No existing coverage reports.
-    raise RuntimeError(f'No existing coverage reports for {project}')
+    logger.info('No existing coverage report. Using empty.')
+    return textcov.Textcov()
 
   # Find the latest generated textcov date.
   latest_dir = sorted(blobs.prefixes)[-1]  # type: ignore
@@ -85,20 +94,60 @@ def load_existing_textcov(project: str,
   # Download and merge them.
   existing_textcov = textcov.Textcov()
   for blob in blobs:
-    if language == 'jvm':
-      if blob.name != 'jacoco.xml':
-        continue
-      print(f'Loading existing textcov from {blob.name}')
-      existing_textcov.merge(textcov.Textcov.from_jvm_file(blob))
-    else:
-      if not blob.name.endswith('.covreport'):
-        continue
+    if not blob.name.endswith('.covreport'):
+      continue
 
-      print(f'Loading existing textcov from {blob.name}')
-      with blob.open('rb') as f:
-        existing_textcov.merge(textcov.Textcov.from_file(f))
+    logger.info('Loading existing textcov from %s', blob.name)
+    with blob.open('rb') as f:
+      existing_textcov.merge(textcov.Textcov.from_file(f))
 
   return existing_textcov
+
+
+def load_existing_jvm_textcov(project: str) -> textcov.Textcov:
+  """Loads existing textcovs for JVM project."""
+  storage_client = storage.Client.create_anonymous_client()
+  bucket = storage_client.bucket(OSS_FUZZ_COVERAGE_BUCKET)
+  blobs = storage_client.list_blobs(bucket,
+                                    prefix=f'{project}/reports/',
+                                    delimiter='/')
+  # Iterate through all blobs first to get the prefixes (i.e. "subdirectories").
+  for blob in blobs:
+    continue
+
+  if not blobs.prefixes:  # type: ignore
+    # No existing coverage reports.
+    logger.info('No existing coverage report. Using empty.')
+    return textcov.Textcov()
+
+  latest_dir = sorted(blobs.prefixes)[-1]  # type: ignore
+  blob = bucket.blob(f'{latest_dir}linux/jacoco.xml')
+  logger.info('Loading existing jacoco.xml textcov from %s', blob.name)
+  with blob.open() as f:
+    return textcov.Textcov.from_jvm_file(f)
+
+
+def load_existing_python_textcov(project: str) -> textcov.Textcov:
+  """Loads existing textcovs for python project."""
+  storage_client = storage.Client.create_anonymous_client()
+  bucket = storage_client.bucket(OSS_FUZZ_INTROSPECTOR_BUCKET)
+  blobs = storage_client.list_blobs(bucket,
+                                    prefix=f'{project}/inspector-report/',
+                                    delimiter='/')
+  # Iterate through all blobs first to get the prefixes (i.e. "subdirectories").
+  for blob in blobs:
+    continue
+
+  if not blobs.prefixes:  # type: ignore
+    # No existing coverage reports.
+    logger.info('No existing coverage report. Using empty.')
+    return textcov.Textcov()
+
+  latest_dir = sorted(blobs.prefixes)[-1]  # type: ignore
+  blob = bucket.blob(f'{latest_dir}all_cov.json')
+  logger.info('Loading existing all_cov.json textcov from %s', blob.name)
+  with blob.open() as f:
+    return textcov.Textcov.from_python_file(f)
 
 
 def load_existing_coverage_summary(project: str) -> dict:
@@ -114,11 +163,12 @@ def load_existing_coverage_summary(project: str) -> dict:
 
   if not blobs.prefixes:  # type: ignore
     # No existing coverage reports.
-    raise RuntimeError(f'No existing coverage reports for {project}')
+    logger.info('No existing coverage reports, using empty one.')
+    return {}
 
   latest_dir = sorted(blobs.prefixes)[-1]  # type: ignore
   blob = bucket.blob(f'{latest_dir}linux/summary.json')
-  print(f'Loading existing summary.json from {blob.name}')
+  logger.info('Loading existing summary.json from %s', blob.name)
   with blob.open() as f:
     return json.load(f)
 
@@ -155,13 +205,13 @@ class _Logger:
     self._result_path = os.path.join(status_path, 'result.json')
 
   def log(self, *args, **kwargs):
-    print(*args, *kwargs)
+    logger.info(*args, *kwargs)
     print(*args, *kwargs, file=self._log)
     self._log.flush()
 
   def return_result(self, result: Result):
     with open(self._result_path, 'w') as f:
-      json.dump(result.dict(), f)
+      json.dump(result.to_dict(), f)
 
     return result
 
@@ -184,27 +234,17 @@ class Evaluator:
 
   def create_ossfuzz_project(self, name: str, target_file: str) -> str:
     """Creates an OSS-Fuzz project with the generated target."""
+    logger.info('target file: %s', target_file)
     generated_project_path = os.path.join(oss_fuzz_checkout.OSS_FUZZ_DIR,
                                           'projects', name)
     if os.path.exists(generated_project_path):
-      print(f'Project {generated_project_path} already exists.')
+      logger.info('Project %s already exists.', generated_project_path)
       return name
 
     existing_project_path = os.path.join(oss_fuzz_checkout.OSS_FUZZ_DIR,
                                          'projects', self.benchmark.project)
 
     shutil.copytree(existing_project_path, generated_project_path)
-
-    # Fix public java class name in target_file
-    if self.benchmark.language == 'jvm':
-      with open(target_file, 'r') as file:
-        code = file.read()
-
-      new = os.path.basename(self.benchmark.target_path).replace('.java', '')
-      code = code.replace('public class Fuzz', f'public class {new}')
-
-      with open(target_file, 'w') as file:
-        file.write(code)
 
     # Copy generated fuzzers to generated_project_path
     shutil.copyfile(
@@ -215,6 +255,7 @@ class Evaluator:
     with open(os.path.join(generated_project_path, 'Dockerfile'), 'a') as f:
       f.write(f'\nCOPY {os.path.basename(target_file)} '
               f'{self.benchmark.target_path}\n')
+
     return name
 
   def _fix_generated_fuzz_target(self, ai_binary: str,
@@ -222,14 +263,14 @@ class Evaluator:
                                  target_path: str, iteration: int,
                                  build_result: BuildResult,
                                  run_result: Optional[RunResult],
-                                 logger: _Logger):
+                                 dual_logger: _Logger):
     """Fixes the generated fuzz target."""
     if build_result.succeeded:
       if run_result:
         error_desc, errors = run_result.semantic_check.get_error_info()
       else:
-        logger.log(f'Warning: Build succeed but no run_result in '
-                   f'{generated_oss_fuzz_project}.')
+        dual_logger.log(f'Warning: Build succeed but no run_result in '
+                        f'{generated_oss_fuzz_project}.')
         error_desc, errors = '', []
     else:
       error_desc, errors = None, build_result.errors
@@ -239,6 +280,57 @@ class Evaluator:
         target_path,
         os.path.join(oss_fuzz_checkout.OSS_FUZZ_DIR, 'projects',
                      generated_oss_fuzz_project, os.path.basename(target_path)))
+
+  def triage_crash(
+      self,
+      ai_binary: str,
+      generated_oss_fuzz_project: str,
+      driver_path: str,
+      run_result: RunResult,
+      dual_logger: _Logger,
+  ) -> str:
+    """Triages the crash."""
+    if run_result.crash_info:
+      crash_info = run_result.crash_info
+      crash_func = run_result.semantic_check.crash_func
+      return crash_triager.llm_triage(
+          ai_binary,
+          driver_path,
+          self.benchmark,
+          crash_info,
+          crash_func,
+          self.builder_runner.fixer_model_name,
+      )
+
+    dual_logger.log(f'Warning: no crash info in {generated_oss_fuzz_project}.')
+    return TriageResult.NOT_APPLICABLE
+
+  def extend_build_with_corpus(self, ai_binary, target_path,
+                               generated_oss_fuzz_project):
+    """Extends an OSS-Fuzz project with corpus generated programmatically."""
+    generated_project_path = os.path.join(oss_fuzz_checkout.OSS_FUZZ_DIR,
+                                          'projects',
+                                          generated_oss_fuzz_project)
+    generated_corp = corpus_generator.get_script(
+        ai_binary, self.builder_runner.fixer_model_name, target_path,
+        self.benchmark)
+
+    corpus_generator_path = os.path.join(generated_project_path, 'corp_gen.py')
+    with open(corpus_generator_path, 'w') as f:
+      f.write(generated_corp)
+
+    with open(os.path.join(generated_project_path, 'Dockerfile'), 'a') as f:
+      f.write('COPY corp_gen.py $SRC/corp_gen.py\n')
+    target_harness_file = os.path.basename(self.benchmark.target_path)
+    target_harness_file = os.path.splitext(target_harness_file)[0]
+    corpus_dst = '/src/generated-corpus/*'
+    with open(os.path.join(generated_project_path, 'build.sh'), 'a') as f:
+      f.write('\n# Generate a corpus for the modified harness.')
+      f.write('\nmkdir -p /src/generated-corpus')
+      f.write('\npushd /src/generated-corpus')
+      f.write('\npython3 $SRC/corp_gen.py')
+      f.write('\npopd')
+      f.write(f'\nzip $OUT/{target_harness_file}_seed_corpus.zip {corpus_dst}')
 
   def check_target(self, ai_binary, target_path: str) -> Result:
     """Builds and runs a target."""
@@ -251,12 +343,16 @@ class Evaluator:
     status_path = os.path.join(self.work_dirs.status, sample_id)
     os.makedirs(status_path, exist_ok=True)
 
-    logger = _Logger(status_path)
+    dual_logger = _Logger(status_path)
 
     # Try building and running the new target.
 
     # TODO: Log build failure.
     # TODO: Log run success/failure.
+
+    if GENERATE_CORPUS:
+      self.extend_build_with_corpus(ai_binary, target_path,
+                                    generated_oss_fuzz_project)
 
     # Loop of evaluating and fixing fuzz target.
     llm_fix_count = 0
@@ -264,10 +360,12 @@ class Evaluator:
       # 1. Evaluating generated driver.
       try:
         build_result, run_result = self.builder_runner.build_and_run(
-            generated_oss_fuzz_project, target_path, llm_fix_count)
+            generated_oss_fuzz_project, target_path, llm_fix_count,
+            self.benchmark.language)
       except Exception as e:
-        logger.log('Exception occurred when building and running fuzz target '
-                   f'in attempt {llm_fix_count}: {e}')
+        dual_logger.log(
+            'Exception occurred when building and running fuzz target '
+            f'in attempt {llm_fix_count}: {e}')
         build_result = BuildResult()
         run_result = None
 
@@ -281,76 +379,94 @@ class Evaluator:
       if self.benchmark.language == 'jvm':
         break
       llm_fix_count += 1
-      logger.log(f'Fixing {target_path} with '
-                 f'{self.builder_runner.fixer_model_name}, '
-                 f'attempt {llm_fix_count}.')
+      dual_logger.log(f'Fixing {target_path} with '
+                      f'{self.builder_runner.fixer_model_name}, '
+                      f'attempt {llm_fix_count}.')
       try:
         self._fix_generated_fuzz_target(ai_binary, generated_oss_fuzz_project,
                                         target_path, llm_fix_count,
-                                        build_result, run_result, logger)
+                                        build_result, run_result, dual_logger)
       except Exception as e:
-        logger.log('Exception occurred when fixing fuzz target in attempt '
-                   f'{llm_fix_count}: {e}')
+        dual_logger.log('Exception occurred when fixing fuzz target in attempt '
+                        f'{llm_fix_count}: {e}')
         break
 
     # Logs and returns the result.
     if not build_result.succeeded:
-      logger.log(f'Failed to build {target_path} with '
-                 f'{self.builder_runner.fixer_model_name} in '
-                 f'{llm_fix_count} iterations of fixing.')
-      return logger.return_result(
+      dual_logger.log(f'Failed to build {target_path} with '
+                      f'{self.builder_runner.fixer_model_name} in '
+                      f'{llm_fix_count} iterations of fixing.')
+      return dual_logger.return_result(
           Result(False, False, 0.0, 0.0, '', '', False,
-                 SemanticCheckResult.NOT_APPLICABLE))
+                 SemanticCheckResult.NOT_APPLICABLE,
+                 TriageResult.NOT_APPLICABLE))
 
-    logger.log(f'Successfully built {target_path} with '
-               f'{self.builder_runner.fixer_model_name} in '
-               f'{llm_fix_count} iterations of fixing.')
+    dual_logger.log(f'Successfully built {target_path} with '
+                    f'{self.builder_runner.fixer_model_name} in '
+                    f'{llm_fix_count} iterations of fixing.')
 
     if not run_result:
-      logger.log(f'Warning: no run result in {generated_oss_fuzz_project}.')
-      return logger.return_result(
+      dual_logger.log(
+          f'Warning: no run result in {generated_oss_fuzz_project}.')
+      return dual_logger.return_result(
           Result(True, False, 0.0, 0.0, '', '', False,
-                 SemanticCheckResult.NOT_APPLICABLE))
+                 SemanticCheckResult.NOT_APPLICABLE,
+                 TriageResult.NOT_APPLICABLE))
+
+    # Triage the crash with LLM
+    dual_logger.log(f'Triaging the crash related to {target_path} with '
+                    f'{self.builder_runner.fixer_model_name}.')
+    run_result.triage = self.triage_crash(
+        ai_binary,
+        generated_oss_fuzz_project,
+        target_path,
+        run_result,
+        dual_logger,
+    )
 
     if run_result.coverage_summary is None or run_result.coverage is None:
-      logger.log(
+      dual_logger.log(
           f'Warning: No cov info in run result of {generated_oss_fuzz_project}.'
       )
-      return logger.return_result(
+      return dual_logger.return_result(
           Result(True, run_result.crashes, 0.0, 0.0, '', '',
-                 not run_result.succeeded, run_result.semantic_check.type))
+                 not run_result.succeeded, run_result.semantic_check.type,
+                 run_result.triage))
 
     if not run_result.succeeded:
-      logger.log(f'Warning: Failed to fix semantic error '
-                 f'{run_result.semantic_check.type}'
-                 f' in {generated_oss_fuzz_project}.')
-      return logger.return_result(
+      dual_logger.log(f'Warning: Failed to fix semantic error '
+                      f'{run_result.semantic_check.type}'
+                      f' in {generated_oss_fuzz_project}.')
+      return dual_logger.return_result(
           Result(True, run_result.crashes, 0.0, 0.0,
                  run_result.coverage_report_path, run_result.reproducer_path,
-                 True, run_result.semantic_check.type))
+                 True, run_result.semantic_check.type, run_result.triage))
 
     # Gets line coverage (diff) details.
     coverage_summary = self._load_existing_coverage_summary()
 
-    total_lines = _compute_total_lines_without_fuzz_targets(
-        coverage_summary, generated_target_name)
-    if self.benchmark.language == 'jvm':
-      # The Jacoco.xml coverage report used to generate
-      # summary.json on OSS-Fuzz for JVM projects does
-      # not trace the source file location. Thus the convertion
-      # may miss some classes because they are not there
-      # during coverage report generation.
-      # This fix get the total lines calculation from the
-      # jacoco.xml report of the current run directly and
-      # compare with the total_lines retrieved from summary.json
-      # Then the larger total_lines is used which is assumed
-      # to be more accurate.
-      total_lines = max(total_lines, run_result.coverage.total_lines)
+    if self.benchmark.language in ['python', 'jvm']:
+      # The Jacoco.xml coverage report used to generate summary.json on OSS-Fuzz
+      # for JVM projects does not trace the source file location. Thus the
+      # conversion may miss some classes because they are not present during
+      # coverage report generation. This fix gets the total line calculation
+      # from the jacoco.xml report of the current run directly and compares it
+      # with the total_lines retrieved from summary.json. Then the larger
+      # total_lines is used which is assumed to be more accurate.
+      # This is the same case for python project which the total line
+      # is determined from the all_cov.json file.
+      total_lines = run_result.coverage.total_lines
+    elif coverage_summary:
+      total_lines = _compute_total_lines_without_fuzz_targets(
+          coverage_summary, generated_target_name)
+    else:
+      total_lines = 0
 
     if run_result.total_pcs:
       coverage_percent = run_result.cov_pcs / run_result.total_pcs
     else:
-      logger.log(f'Warning: total_pcs == 0 in {generated_oss_fuzz_project}.')
+      dual_logger.log(
+          f'Warning: total_pcs == 0 in {generated_oss_fuzz_project}.')
       coverage_percent = 0.0
 
     existing_textcov = self._load_existing_textcov()
@@ -359,18 +475,21 @@ class Evaluator:
     if total_lines:
       coverage_diff = run_result.coverage.covered_lines / total_lines
     else:
-      logger.log(f'Warning: total_lines == 0 in {generated_oss_fuzz_project}.')
+      dual_logger.log(
+          f'Warning: total_lines == 0 in {generated_oss_fuzz_project}.')
       coverage_diff = 0.0
 
-    logger.log(f'Result for {generated_oss_fuzz_project}: '
-               f'crashes={run_result.crashes}, coverage={coverage_percent} '
-               f'({run_result.cov_pcs}/{run_result.total_pcs}), '
-               f'coverage diff={coverage_diff} '
-               f'({run_result.coverage.covered_lines}/{total_lines})')
-    return logger.return_result(
+    dual_logger.log(
+        f'Result for {generated_oss_fuzz_project}: '
+        f'crashes={run_result.crashes}, coverage={coverage_percent} '
+        f'({run_result.cov_pcs}/{run_result.total_pcs}), '
+        f'coverage diff={coverage_diff} '
+        f'({run_result.coverage.covered_lines}/{total_lines})')
+    return dual_logger.return_result(
         Result(True, run_result.crashes, coverage_percent, coverage_diff,
                run_result.coverage_report_path, run_result.reproducer_path,
-               not run_result.succeeded, run_result.semantic_check.type))
+               not run_result.succeeded, run_result.semantic_check.type,
+               run_result.triage, run_result.coverage))
 
   def _load_existing_coverage_summary(self) -> dict:
     """Load existing summary.json."""
@@ -378,5 +497,10 @@ class Evaluator:
 
   def _load_existing_textcov(self) -> textcov.Textcov:
     """Loads existing textcovs."""
-    return load_existing_textcov(self.benchmark.project,
-                                 self.benchmark.language)
+    if self.benchmark.language == 'jvm':
+      return load_existing_jvm_textcov(self.benchmark.project)
+
+    if self.benchmark.language == 'python':
+      return load_existing_python_textcov(self.benchmark.project)
+
+    return load_existing_textcov(self.benchmark.project)

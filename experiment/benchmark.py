@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import sys
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import yaml
 
@@ -47,22 +47,28 @@ class Benchmark:
     """Converts and saves selected fields of a benchmark to a YAML file."""
     # Register the custom representer
     yaml.add_representer(str, quoted_string_presenter)
-    result = {
-        'project':
-            benchmarks[0].project,
-        'language':
-            benchmarks[0].language,
-        'target_path':
-            benchmarks[0].target_path,
-        'target_name':
-            benchmarks[0].target_name,
-        'functions': [{
-            'signature': b.function_signature,
-            'name': b.function_name,
-            'return_type': b.return_type,
-            'params': b.params,
-        } for b in benchmarks],
+    result: dict[str, Any] = {
+        'project': benchmarks[0].project,
+        'language': benchmarks[0].language,
+        'target_path': benchmarks[0].target_path,
+        'target_name': benchmarks[0].target_name,
     }
+    for benchmark in benchmarks:
+      if benchmark.test_file_path:
+        if 'test_files' not in result:
+          result['test_files'] = []
+        result['test_files'].append(
+            {'test_file_path': benchmark.test_file_path})
+      else:
+        if 'functions' not in result:
+          result['functions'] = []
+        result['functions'].append({
+            'signature': benchmark.function_signature,
+            'name': benchmark.function_name,
+            'return_type': benchmark.return_type,
+            'params': benchmark.params
+        })
+
     with open(os.path.join(outdir, f'{benchmarks[0].project}.yaml'),
               'w') as file:
       yaml.dump(result, file, default_flow_style=False, width=sys.maxsize)
@@ -81,29 +87,56 @@ class Benchmark:
     cppify_headers = data.get('cppify_headers', False)
     commit = data.get('commit')
     functions = data.get('functions', [])
-    for function in functions:
-      # Long raw_function_names (particularly for c++ projects) may exceed
-      # filesystem limits on file path/name length when creating WorkDir.
-      max_len = os.pathconf('/', 'PC_NAME_MAX') - len('output-')
-      # Docker tag name cannot exceed 127 characters, and will be suffixed by
-      # '<sample-id>-experiment'.
-      docker_name_len = 127 - len('-03-experiment')
-      max_len = min(max_len, docker_name_len)
-      truncated_id = f'{project_name}-{function.get("name")}'[:max_len]
-      benchmarks.append(
-          cls(truncated_id.lower(),
-              data['project'],
-              data['language'],
-              function.get('signature'),
-              function.get('name'),
-              function.get('return_type'),
-              function.get('params'),
-              data['target_path'],
-              data.get('target_name'),
-              use_project_examples=use_project_examples,
-              cppify_headers=cppify_headers,
-              commit=commit,
-              use_context=use_context))
+
+    test_files = data.get('test_files', [])
+    if test_files:
+      for test_file in test_files:
+        max_len = os.pathconf('/', 'PC_NAME_MAX') - len('output-')
+        test_file_path = test_file.get('test_file_path')
+        normalized_test_path = test_file_path.replace('/', '_').replace(
+            '.', '_').replace('-', '_')
+        truncated_id = f'{project_name}-{normalized_test_path}'[:max_len]
+
+        benchmarks.append(
+            cls(
+                truncated_id.lower(),
+                data['project'],
+                data['language'],
+                '',
+                '',
+                '',
+                [],
+                data['target_path'],
+                data.get('target_name', ''),
+                test_file_path=test_file_path,
+            ))
+
+    if functions:
+      # function type benchmark
+      for function in functions:
+        # Long raw_function_names (particularly for c++ projects) may exceed
+        # filesystem limits on file path/name length when creating WorkDir.
+        max_len = os.pathconf('/', 'PC_NAME_MAX') - len('output-')
+        # Docker tag name cannot exceed 127 characters, and will be suffixed by
+        # '<sample-id>-experiment'.
+        docker_name_len = 127 - len('-03-experiment')
+        max_len = min(max_len, docker_name_len)
+        truncated_id = f'{project_name}-{function.get("name")}'[:max_len]
+        benchmarks.append(
+            cls(truncated_id.lower(),
+                data['project'],
+                data['language'],
+                function.get('signature'),
+                function.get('name'),
+                function.get('return_type'),
+                function.get('params'),
+                data['target_path'],
+                data.get('target_name'),
+                use_project_examples=use_project_examples,
+                cppify_headers=cppify_headers,
+                commit=commit,
+                use_context=use_context,
+                function_dict=function))
 
     return benchmarks
 
@@ -121,7 +154,8 @@ class Benchmark:
                cppify_headers=False,
                use_context=False,
                commit=None,
-               function_dict: Optional[dict] = None):
+               function_dict: Optional[dict] = None,
+               test_file_path: str = ''):
     self.id = benchmark_id
     self.project = project
     self.language = language
@@ -136,21 +170,34 @@ class Benchmark:
     self.use_context = use_context
     self.cppify_headers = cppify_headers
     self.commit = commit
+    self.test_file_path = test_file_path
 
     if self.language == 'jvm':
-      # For java project, in order to differentiate between overloaded methos,
+      # For java projects, in order to differentiate between overloaded methods
       # the full signature is being used as function_name. The full signature
-      # is following the format of
+      # is following the format of:
       # [<Full_Class_Name].<Method_Name>(<Parameter_List>)
-      # The benchmark id uses the function_signature directly and used as the
-      # name of the result directory. To avoid confusion in the directory name,
-      # these special characters in the id (coming from the function signature)
-      # are removed. Additional special characters exist for constructors which
-      # will shown as <init> or <cinit> because constructors does not have names.
+      # The benchmark id uses the function_signature directly and is used as
+      # the name of the result directory. In order to avoid confusion in the
+      # directory name remove special characters in the id coming from the
+      # function signature. Additional special characters exist for
+      # constructors which will be shown as <init> because constructors do not
+      # have names.
       self.function_signature = self.function_name
       self.id = self.id.replace('<', '').replace('>', '')
       self.id = self.id.replace('[', '').replace(']', '')
       self.id = self.id.replace('(', '_').replace(')', '').replace(',', '_')
+
+    if self.language == 'python':
+      # For python projects, classes and methods name could begins with
+      # underscore character. This could affect the benchmark_id and cause
+      # OSS-Fuzz build failed if dot and underscore character is put together.
+      # Special handling of benchmark_id is needed to avoid this situation.
+      # For example, zipp._difference in zip project will have benchmark id of
+      # zipp-zipp._difference and the pattern '._' cause OSS-Fuzz failed to
+      # recognise the project name and needed to be replaced by
+      # zipp-zipp.difference.
+      self.id = self.id.replace('._', '.')
 
   def __str__(self):
     return (f'Benchmark<id={self.id}, project={self.project}, '
@@ -173,6 +220,31 @@ class Benchmark:
   def file_type(self) -> FileType:
     """Returns the file type of the benchmark."""
     return get_file_type(self.target_path)
+
+  @property
+  def is_c_target(self) -> bool:
+    """Validates if the project is written in C."""
+    return self.file_type.value.lower() == 'c'
+
+  @property
+  def is_cpp_target(self) -> bool:
+    """Validates if the project is written in C++."""
+    return self.file_type.value.lower() == 'c++'
+
+  @property
+  def is_c_projcet(self) -> bool:
+    """Validates if the project is written in C."""
+    return self.language.lower() == 'c'
+
+  @property
+  def is_cpp_projcet(self) -> bool:
+    """Validates if the project is written in C++."""
+    return self.language.lower() == 'c++'
+
+  @property
+  def needs_extern(self) -> bool:
+    """Checks if it is C++ fuzz target for a C project, which needs `extern`."""
+    return self.is_cpp_target and self.is_c_projcet
 
 
 def get_file_type(file_path: str) -> FileType:

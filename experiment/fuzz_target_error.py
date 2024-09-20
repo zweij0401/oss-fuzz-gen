@@ -14,8 +14,11 @@
 """
 Helper class for fuzz target semantic errors.
 """
+import logging
 import re
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class SemanticCheckResult:
@@ -31,6 +34,8 @@ class SemanticCheckResult:
   NO_COV_INCREASE = 'NO_COV_INCREASE'
   NULL_DEREF = 'NULL_DEREF'
   SIGNAL = 'SIGNAL'
+  EXIT = 'EXIT'
+  OVERWRITE_CONST = 'OVERWRITE_CONST'
 
   # Regex for extract crash symptoms.
   # Matches over 18 types of ASAN errors symptoms
@@ -44,6 +49,9 @@ class SemanticCheckResult:
   # E.g., matches 'SCARINESS: 10 (null-deref)'
   SYMPTOM_SCARINESS = re.compile(r'SCARINESS:\s*\d+\s*\((.*)\)\n')
 
+  # Regex for extract crash information.
+  INFO_CRASH = re.compile(r'ERROR: (.*?)(?=SUMMARY)', re.DOTALL)
+
   NO_COV_INCREASE_MSG_PREFIX = 'No code coverage increasement'
 
   @classmethod
@@ -52,15 +60,15 @@ class SemanticCheckResult:
     # Need to catch this before ASAN.
     match = cls.SYMPTOM_SCARINESS.search(fuzzlog)
     if match:
-      return match.group(1)
+      return match.group(1).strip()
 
     match = cls.SYMPTOM_ASAN.search(fuzzlog)
     if match:
-      return f'ASAN-{match.group(0)}'
+      return f'ASAN-{match.group(0).strip()}'
 
     match = cls.SYMPTOM_LIBFUZZER.search(fuzzlog)
     if match:
-      return f'libFuzzer-{match.group(0)}'
+      return f'libFuzzer-{match.group(0).strip()}'
 
     return ''
 
@@ -69,13 +77,25 @@ class SemanticCheckResult:
     return (error_desc is not None) and error_desc.startswith(
         cls.NO_COV_INCREASE_MSG_PREFIX)
 
+  @classmethod
+  def extract_crash_info(cls, fuzzlog: str) -> str:
+    """Extracts crash information from fuzzing logs."""
+    match = cls.INFO_CRASH.search(fuzzlog)
+    if match:
+      return match.group(1)
+
+    logging.warning('Failed to match crash information.')
+    return ''
+
   def __init__(self,
                err_type: str,
                crash_symptom: str = '',
-               crash_stacks: Optional[list[list[str]]] = None):
+               crash_stacks: Optional[list[list[str]]] = None,
+               crash_func: Optional[dict] = None):
     self.type = err_type
     self.crash_symptom = crash_symptom
     self.crash_stacks = crash_stacks if crash_stacks else []
+    self.crash_func = crash_func if crash_func else {}
 
   def _get_error_desc(self) -> str:
     """Returns one sentence error description used in fix prompt."""
@@ -110,6 +130,16 @@ class SemanticCheckResult:
       return ('Abort with signal, indicating the fuzz target has violated some '
               'assertion in the project, likely due to improper parameter '
               'initialization or incorrect function usages.')
+    if self.type == self.EXIT:
+      return ('Fuzz target exited in a controlled manner without showing any '
+              'sign of memory corruption, likely due to the fuzz target is not '
+              'well designed to effectively find memory corruption '
+              'vulnerability in the function-under-test.')
+    if self.type == self.OVERWRITE_CONST:
+      return ('Fuzz target modified a const data. To fix this, ensure that all '
+              'input data passed to the fuzz target is treated as read-only '
+              'and not modified. Copy the input data to a separate buffer if '
+              'any modifications are necessary.')
 
     return ''
 

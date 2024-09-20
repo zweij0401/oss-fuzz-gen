@@ -15,6 +15,7 @@
 """Manager for running auto-gen from scratch."""
 
 import argparse
+import logging
 import os
 import shutil
 import subprocess
@@ -22,11 +23,14 @@ import sys
 import threading
 from typing import List
 
+import constants
 import templates
 
 silent_global = False
 
-SHARED_MEMORY_RESULTS_DIR = 'autogen-results'
+logger = logging.getLogger(name=__name__)
+LOG_FMT = ('%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] '
+           ': %(funcName)s: %(message)s')
 
 
 def setup_worker_project(oss_fuzz_base: str, project_name: str, llm_model: str):
@@ -46,13 +50,15 @@ def setup_worker_project(oss_fuzz_base: str, project_name: str, llm_model: str):
   if llm_model == 'vertex':
     json_config = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', None)
     if json_config is None:
-      print('vertex model is set but could not find configuration file.')
-      print('Plese set GOOGLE_APPLICATION_CREDENTIALS env variable.')
+      logger.info('vertex model is set but could not find configuration file.')
+      logger.info('Plese set GOOGLE_APPLICATION_CREDENTIALS env variable.')
       sys.exit(1)
     shutil.copyfile(json_config, os.path.join(temp_project_dir, 'creds.json'))
 
   # Copy over the generator
-  files_to_copy = {'build_generator.py', 'manager.py', 'templates.py'}
+  files_to_copy = {
+      'build_generator.py', 'manager.py', 'templates.py', 'constants.py'
+  }
   for target_file in files_to_copy:
     shutil.copyfile(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), target_file),
@@ -60,17 +66,17 @@ def setup_worker_project(oss_fuzz_base: str, project_name: str, llm_model: str):
 
   # Build a version of the project
   if silent_global:
-    subprocess.check_call('python3 infra/helper.py build_fuzzers %s' %
-                          (project_name),
-                          shell=True,
-                          cwd=oss_fuzz_base,
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL)
+    subprocess.check_call(
+        f'python3 infra/helper.py build_fuzzers {project_name}',
+        shell=True,
+        cwd=oss_fuzz_base,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL)
   else:
-    subprocess.check_call('python3 infra/helper.py build_fuzzers %s' %
-                          (project_name),
-                          shell=True,
-                          cwd=oss_fuzz_base)
+    subprocess.check_call(
+        f'python3 infra/helper.py build_fuzzers {project_name}',
+        shell=True,
+        cwd=oss_fuzz_base)
 
 
 def run_coverage_runs(oss_fuzz_base: str, worker_name: str) -> None:
@@ -80,10 +86,10 @@ def run_coverage_runs(oss_fuzz_base: str, worker_name: str) -> None:
   the harness generation because we need the OSS-Fuzz base-runner image, where
   the generation is based on the OSS-Fuzz base-builder image."""
   worker_out = os.path.join(oss_fuzz_base, 'build', 'out', worker_name,
-                            SHARED_MEMORY_RESULTS_DIR)
+                            constants.SHARED_MEMORY_RESULTS_DIR)
 
   for auto_fuzz_dir in os.listdir(worker_out):
-    print(auto_fuzz_dir)
+    logger.info(auto_fuzz_dir)
     # Only continue if there is a corpus collected.
     corpus_dir = os.path.join(worker_out, auto_fuzz_dir, 'corpus',
                               'generated-fuzzer-no-leak')
@@ -107,7 +113,7 @@ def run_coverage_runs(oss_fuzz_base: str, worker_name: str) -> None:
       ]
       subprocess.check_call(' '.join(cmd_to_run), shell=True, cwd=oss_fuzz_base)
     except subprocess.CalledProcessError:
-      print(f'Failed coverage build: {target_cov_name}')
+      logger.info('Failed coverage build: %s', target_cov_name)
       continue
 
     # Run coverage and save report in the main folder.
@@ -125,7 +131,7 @@ def run_coverage_runs(oss_fuzz_base: str, worker_name: str) -> None:
       ]
       subprocess.check_call(' '.join(cmd_to_run), shell=True, cwd=oss_fuzz_base)
     except subprocess.CalledProcessError:
-      print(f'Failed coverage run: {target_cov_name}')
+      logger.info('Failed coverage run: %s', target_cov_name)
       continue
 
 
@@ -136,22 +142,27 @@ def run_autogen(github_url,
                 disable_autofuzz,
                 model,
                 openai_api_key=None,
-                targets_per_heuristic=5):
+                targets_per_heuristic=5,
+                build_heuristics='all',
+                generator_heuristics='all',
+                max_successful_builds: int = -1):
   """Launch auto-gen analysis within OSS-Fuzz container."""
 
-  initiator_cmd = 'python3 /src/manager.py %s -o %s' % (github_url, outdir)
+  initiator_cmd = f'python3 /src/manager.py {github_url} -o {outdir}'
   if disable_autofuzz:
     initiator_cmd += ' --disable-fuzzgen'
-  initiator_cmd += ' --model=%s' % (model)
-  initiator_cmd += ' --targets-per-heuristic=%d' % (targets_per_heuristic)
+  initiator_cmd += f' --model={model}'
+  initiator_cmd += f' --targets-per-heuristic={targets_per_heuristic}'
+  if max_successful_builds > 0:
+    initiator_cmd += f' --max-successful={max_successful_builds}'
 
   extra_environment = []
-  if model == 'vertex':
+  if model == constants.MODEL_VERTEX:
     extra_environment.append('-e')
     extra_environment.append('GOOGLE_APPLICATION_CREDENTIALS=/src/creds.json')
-  elif model == 'openai':
+  elif model == constants.MODEL_GPT_35_TURBO:
     extra_environment.append('-e')
-    extra_environment.append('OPENAI_API_KEY=%s' % (openai_api_key))
+    extra_environment.append(f'OPENAI_API_KEY={openai_api_key}')
 
   cmd = [
       'docker',
@@ -167,15 +178,19 @@ def run_autogen(github_url,
       'HELPER=True',
       '-e',
       'FUZZING_LANGUAGE=c++',
+      '-e',
+      f'BUILD_HEURISTICS={build_heuristics}',
+      '-e',
+      f'GENERATOR_HEURISTICS={generator_heuristics}',
   ] + extra_environment
 
   cmd += [
       '-v',
-      '%s/build/out/%s:/out' % (oss_fuzz_base, worker_project),
+      f'{oss_fuzz_base}/build/out/{worker_project}:/out',
       '-v',
-      '%s/build/work/%s:/work' % (oss_fuzz_base, worker_project),
+      f'{oss_fuzz_base}/build/work/{worker_project}:/work',
       '-t',
-      'gcr.io/oss-fuzz/%s' % (worker_project),
+      f'gcr.io/oss-fuzz/{worker_project}',
       # Command to run inside the container
       initiator_cmd
   ]
@@ -217,7 +232,10 @@ def run_on_targets(target,
                    llm_model,
                    semaphore=None,
                    disable_autofuzz=False,
-                   targets_per_heuristic=5):
+                   targets_per_heuristic=5,
+                   build_heuristics='all',
+                   generator_heuristics='all',
+                   max_successful_builds: int = -1):
   """Thread entry point for single project auto-gen."""
 
   if semaphore is not None:
@@ -225,9 +243,9 @@ def run_on_targets(target,
 
   openai_api_key = os.getenv('OPENAI_API_KEY', None)
 
-  outdir = os.path.join('/out/', SHARED_MEMORY_RESULTS_DIR)
+  outdir = os.path.join('/out/', constants.SHARED_MEMORY_RESULTS_DIR)
   with open('status-log.txt', 'a') as f:
-    f.write("Targeting: %s :: %d\n" % (target, idx))
+    f.write(f'Targeting: {target} :: {idx}\n')
   run_autogen(target,
               outdir,
               oss_fuzz_base,
@@ -235,7 +253,19 @@ def run_on_targets(target,
               disable_autofuzz,
               llm_model,
               targets_per_heuristic=targets_per_heuristic,
-              openai_api_key=openai_api_key)
+              openai_api_key=openai_api_key,
+              build_heuristics=build_heuristics,
+              generator_heuristics=generator_heuristics,
+              max_successful_builds=max_successful_builds)
+
+  # Cleanup the OSS-Fuzz docker image
+  clean_up_cmd = [
+      'docker', 'image', 'rm', f'gcr.io/oss-fuzz/{worker_project_name}'
+  ]
+  try:
+    subprocess.check_call(' '.join(clean_up_cmd), shell=True)
+  except subprocess.CalledProcessError:
+    pass
 
   if semaphore is not None:
     semaphore.release()
@@ -245,18 +275,19 @@ def get_next_worker_project(oss_fuzz_base: str) -> str:
   """Gets next OSS-Fuzz worker projecet."""
   max_idx = -1
   for project_dir in os.listdir(os.path.join(oss_fuzz_base, 'projects')):
-    if not 'temp-project-' in project_dir:
+    if not constants.PROJECT_BASE in project_dir:
       continue
     try:
-      tmp_idx = int(project_dir.replace('temp-project-', ''))
+      tmp_idx = int(project_dir.replace(constants.PROJECT_BASE, ''))
       max_idx = max(tmp_idx, max_idx)
     except:
       continue
-  return f'temp-project-{max_idx+1}'
+  return f'{constants.PROJECT_BASE}{max_idx+1}'
 
 
 def run_parallels(oss_fuzz_base, target_repositories, disable_autofuzz,
-                  targets_per_heuristic, llm_model):
+                  targets_per_heuristic, llm_model, build_heuristics,
+                  generator_heuristics, max_successful_builds):
   """Run auto-gen on a list of projects in parallel.
 
   Parallelisation is done by way of threads. Practically
@@ -267,13 +298,14 @@ def run_parallels(oss_fuzz_base, target_repositories, disable_autofuzz,
   jobs = []
   for idx, target in enumerate(target_repositories):
     worker_project_name = get_next_worker_project(oss_fuzz_base)
-    print(f'Worker project name {worker_project_name}')
+    logger.info('Worker project name %s', worker_project_name)
 
     setup_worker_project(oss_fuzz_base, worker_project_name, llm_model)
     proc = threading.Thread(target=run_on_targets,
                             args=(target, oss_fuzz_base, worker_project_name,
                                   idx, llm_model, semaphore, disable_autofuzz,
-                                  targets_per_heuristic))
+                                  targets_per_heuristic, build_heuristics,
+                                  generator_heuristics, max_successful_builds))
     jobs.append(proc)
     proc.start()
 
@@ -282,12 +314,14 @@ def run_parallels(oss_fuzz_base, target_repositories, disable_autofuzz,
 
 
 def run_sequential(oss_fuzz_base, target_repositories, disable_autofuzz,
-                   targets_per_heuristic, llm_model):
+                   targets_per_heuristic, llm_model, build_heuristics,
+                   generator_heuristics):
   """Run auto-gen on a list of projects sequentially."""
   for idx, target in enumerate(target_repositories):
     worker_project_name = get_next_worker_project(oss_fuzz_base)
     run_on_targets(target, oss_fuzz_base, worker_project_name, idx, llm_model,
-                   None, disable_autofuzz, targets_per_heuristic)
+                   None, disable_autofuzz, targets_per_heuristic,
+                   build_heuristics, generator_heuristics)
 
 
 def parse_commandline():
@@ -308,33 +342,59 @@ def parse_commandline():
                       '-s',
                       help='Disable logging in subprocess.',
                       action='store_true')
-  parser.add_argument('--model', '-m', help='LLM model to use', type=str)
+  parser.add_argument('--build-heuristics',
+                      '-b',
+                      help='Comma-separated string of build heuristics to use',
+                      default='all')
+  parser.add_argument(
+      '--generator-heuristics',
+      '-g',
+      help='Comma-separated string of generator heuristics to use.',
+      default='all')
+  parser.add_argument(
+      '--model',
+      '-m',
+      help=f'LLM model to use. Available: {str(constants.MODELS)}',
+      type=str)
+  parser.add_argument('--max_successful',
+                      '-ma',
+                      help='Max number of successful builds to generate.',
+                      type=int)
   return parser.parse_args()
+
+
+def setup_logging():
+  logging.basicConfig(level=logging.INFO, format=LOG_FMT)
+
+
+def extract_target_repositories(target_input) -> list[str]:
+  if os.path.isfile(target_input):
+    target_repositories = read_targets_file(target_input)
+  else:
+    target_repositories = [target_input]
+  logger.info(target_repositories)
+  return target_repositories
 
 
 def main():
   global silent_global
 
   args = parse_commandline()
-  oss_fuzz_base = args.oss_fuzz
-  target = args.input
-  disable_autofuzz = args.disable_fuzzgen
 
-  if os.path.isfile(target):
-    target_repositories = read_targets_file(target)
-  else:
-    target_repositories = [target]
-  print(target_repositories)
-
+  setup_logging()
+  target_repositories = extract_target_repositories(args.input)
   silent_global = args.silent
 
   use_multithreading = True
   if use_multithreading:
-    run_parallels(oss_fuzz_base, target_repositories, disable_autofuzz,
-                  args.targets_per_heuristic, args.model)
+    run_parallels(os.path.abspath(args.oss_fuzz), target_repositories,
+                  args.disable_fuzzgen, args.targets_per_heuristic, args.model,
+                  args.build_heuristics, args.generator_heuristics,
+                  args.max_successful)
   else:
-    run_sequential(oss_fuzz_base, target_repositories, disable_autofuzz,
-                   args.targets_per_heuristic, args.model)
+    run_sequential(os.path.abspath(args.oss_fuzz), target_repositories,
+                   args.disable_fuzzgen, args.targets_per_heuristic, args.model,
+                   args.build_heuristics, args.generator_heuristics)
 
 
 if __name__ == '__main__':

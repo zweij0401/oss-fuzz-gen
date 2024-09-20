@@ -34,6 +34,12 @@ RUN_TIMEOUT=$3
 SUB_DIR=$4
 MODEL=$5
 DELAY=$6
+USE_LOCAL_INTROSPECTOR=$7
+NUM_SAMPLES=$8
+LLM_FIX_LIMIT=$9
+VARY_TEMPERATURE=${10}
+AGENT=${11}
+
 # Uses python3 by default and /venv/bin/python3 for Docker containers.
 PYTHON="$( [[ -x "/venv/bin/python3" ]] && echo "/venv/bin/python3" || echo "python3" )"
 export PYTHON
@@ -74,7 +80,7 @@ fi
 # The LLM used to generate and fix fuzz targets.
 if [[ $MODEL = '' ]]
 then
-  MODEL='vertex_ai_code-bison-32k'
+  MODEL='vertex_ai_gemini-1-5'
   echo "LLM was not specified as the fifth argument. Defaulting to ${MODEL:?}."
 fi
 
@@ -83,6 +89,44 @@ if [[ $DELAY = '' ]]
 then
   DELAY='0'
   echo "DELAY was not specified as the sixth argument. Defaulting to ${DELAY:?}."
+fi
+
+if [[ "$USE_LOCAL_INTROSPECTOR" = "true" ]]
+then
+  export BENCHMARK_SET
+  INTROSPECTOR_ENDPOINT="http://127.0.0.1:8080/api"
+  echo "USE_LOCAL_INTROSPECTOR is enabled: ${INTROSPECTOR_ENDPOINT:?}"
+  bash report/launch_local_introspector.sh
+else
+  INTROSPECTOR_ENDPOINT="https://introspector.oss-fuzz.com/api"
+  echo "USE_LOCAL_INTROSPECTOR was not specified as the 7th argument. Defaulting to ${INTROSPECTOR_ENDPOINT:?}."
+fi
+
+if [[ "$NUM_SAMPLES" = '' ]]
+then
+  NUM_SAMPLES='10'
+  echo "NUM_SAMPLES was not specified as the 8th argument. Defaulting to ${NUM_SAMPLES:?}."
+fi
+
+if [[ "$LLM_FIX_LIMIT" = '' ]]
+then
+  LLM_FIX_LIMIT='5'
+  echo "LLM_FIX_LIMIT was not specified as the 9th argument. Defaulting to ${LLM_FIX_LIMIT:?}."
+else
+  export LLM_FIX_LIMIT
+  echo "LLM_FIX_LIMIT is set to ${LLM_FIX_LIMIT:?}."
+fi
+
+if [[ "$VARY_TEMPERATURE" = "true" ]]
+then
+    VARY_TEMPERATURE=(0.5 0.6 0.7 0.8 0.9)
+else
+    VARY_TEMPERATURE=()
+fi
+
+AGENT_ARG=""
+if [[ "$AGENT" = "true" ]]; then
+    AGENT_ARG="--agent"
 fi
 
 DATE=$(date '+%Y-%m-%d')
@@ -95,6 +139,8 @@ EXPERIMENT_NAME="${DATE:?}-${FREQUENCY_LABEL:?}-${BENCHMARK_SET:?}"
 # Report directory uses the same name as experiment.
 # See upload_report.sh on how this is used.
 GCS_REPORT_DIR="${SUB_DIR:?}/${EXPERIMENT_NAME:?}"
+# Trends report use a similarly named path.
+GCS_TREND_REPORT_PATH="${SUB_DIR:?}/${EXPERIMENT_NAME:?}.json"
 
 # Generate a report and upload it to GCS
 bash report/upload_report.sh "${LOCAL_RESULTS_DIR:?}" "${GCS_REPORT_DIR:?}" "${BENCHMARK_SET:?}" "${MODEL:?}" &
@@ -109,16 +155,42 @@ $PYTHON run_all_experiments.py \
   --cloud-experiment-bucket 'oss-fuzz-gcb-experiment-run-logs' \
   --template-directory 'prompts/template_xml' \
   --work-dir ${LOCAL_RESULTS_DIR:?} \
-  --num-samples 10 \
+  --num-samples "${NUM_SAMPLES:?}" \
   --delay "${DELAY:?}" \
-  --model "$MODEL"
+  --context \
+  --introspector-endpoint ${INTROSPECTOR_ENDPOINT} \
+  --temperature-list "${VARY_TEMPERATURE[@]}" \
+  --model "$MODEL" \
+  $AGENT_ARG
 
 export ret_val=$?
 
 touch /experiment_ended
 
+if [[ "$USE_LOCAL_INTROSPECTOR" = "true" ]]
+then
+  echo "Shutting down introspector"
+  curl --silent http://localhost:8080/api/shutdown || true
+fi
+
 # Wait for the report process to finish uploading.
 wait $pid_report
+
+$PYTHON -m report.trends_report \
+  --results-dir ${LOCAL_RESULTS_DIR:?} \
+  --output-path "gs://oss-fuzz-gcb-experiment-run-logs/trend-reports/${GCS_TREND_REPORT_PATH:?}" \
+  --name ${EXPERIMENT_NAME:?} \
+  --date ${DATE:?} \
+  --url "https://llm-exp.oss-fuzz.com/Result-reports/${GCS_REPORT_DIR:?}" \
+  --benchmark-set ${BENCHMARK_SET:?} \
+  --run-timeout ${RUN_TIMEOUT:?} \
+  --num-samples ${NUM_SAMPLES:?} \
+  --llm-fix-limit ${LLM_FIX_LIMIT:?} \
+  --model ${MODEL:?} \
+  --tags ${FREQUENCY_LABEL:?} ${SUB_DIR:?} \
+  --commit-hash "$(git rev-parse HEAD)" \
+  --commit-date "$(git show --no-patch --format=%cs)" \
+  --git-branch "$(git branch --show)"
 
 # Exit with the return value of `./run_all_experiments`.
 exit $ret_val

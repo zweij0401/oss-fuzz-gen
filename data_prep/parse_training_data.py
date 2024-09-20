@@ -27,13 +27,17 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
 from google.cloud import storage
 
+logger = logging.getLogger(__name__)
+
 STORAGE_CLIENT = storage.Client()
+FUZZ_TARGET_FIXING_DIR_PATTERN = r'\d+-F\d+'
 
 
 class Benchmark:
@@ -48,10 +52,18 @@ class Benchmark:
     """Returns the prompt used by the benchmark."""
     prompt_path = os.path.join(self.benchmark_dir, 'prompt.txt')
     if not os.path.isfile(prompt_path):
-      logging.warning('Prompt does not exist: %s', prompt_path)
+      logger.warning('Prompt does not exist: %s', prompt_path)
       return ''
     with open(prompt_path) as prompt_file:
       return prompt_file.read()
+
+  def _get_code_fixing_dirs(self, fixed_target_dir):
+    """Gets the directories for fixing fuzz targets."""
+    return [
+        item for item in os.listdir(fixed_target_dir)
+        if (os.path.isdir(os.path.join(fixed_target_dir, item)) and
+            re.match(FUZZ_TARGET_FIXING_DIR_PATTERN, item))
+    ]
 
   @property
   def targets(self) -> Dict[str, List[str]]:
@@ -60,7 +72,7 @@ class Benchmark:
     all_targets = {}
     raw_target_dir = os.path.join(self.benchmark_dir, 'raw_targets')
     if not os.path.isdir(raw_target_dir):
-      logging.warning('Raw target dir does not exist: %s', raw_target_dir)
+      logger.warning('Raw target dir does not exist: %s', raw_target_dir)
       return {}
     raw_targets = [
         instance for instance in os.listdir(raw_target_dir)
@@ -73,12 +85,9 @@ class Benchmark:
 
     fixed_target_dir = os.path.join(self.benchmark_dir, 'fixed_targets')
     if not os.path.isdir(fixed_target_dir):
-      logging.warning('Fixed target dir does not exist: %s', fixed_target_dir)
+      logger.warning('Fixed target dir does not exist: %s', fixed_target_dir)
       return {}
-    fix_dirs = [
-        instance for instance in os.listdir(fixed_target_dir)
-        if os.path.isdir(os.path.join(fixed_target_dir, instance))
-    ]
+    fix_dirs = self._get_code_fixing_dirs(fixed_target_dir)
     for fix_dir in sorted(fix_dirs):
       instance, _ = fix_dir.split('-F')
       code_path = [
@@ -89,8 +98,8 @@ class Benchmark:
       with open(code_path) as code_file:
         fixed_code = code_file.read()
       if not all_targets.get(instance):
-        logging.warning('Benchmark instance does not exist: %s - %s',
-                        self.benchmark_dir, instance)
+        logger.warning('Benchmark instance does not exist: %s - %s',
+                       self.benchmark_dir, instance)
         continue
       all_targets[instance].append(fixed_code)
     return all_targets
@@ -102,20 +111,20 @@ class Benchmark:
     all_status = {}
     status_dir = os.path.join(self.benchmark_dir, 'status')
     if not os.path.isdir(status_dir):
-      logging.warning('Status dir does not exist: %s', status_dir)
+      logger.warning('Status dir does not exist: %s', status_dir)
       return {}
     for instance in os.listdir(status_dir):
       status_json_path = os.path.join(status_dir, instance, 'result.json')
       if not os.path.isfile(status_json_path):
-        logging.info('Missing result JSON of benchmark instance: %s - %s',
-                     self.benchmark, instance)
+        logger.info('Missing result JSON of benchmark instance: %s - %s',
+                    self.benchmark, instance)
         continue
       with open(status_json_path) as file:
         try:
           all_status[instance] = json.load(file)
         except Exception as e:
-          logging.warning(e)
-          logging.warning(status_json_path)
+          logger.warning(e)
+          logger.warning(status_json_path)
 
     return all_status
 
@@ -193,7 +202,7 @@ class Benchmark:
     data_filapath = os.path.join(save_dir, data_filename)
     with open(data_filapath, 'w') as file:
       json.dump(data, file, indent=4)
-    logging.info('Saved to: %s', data_filapath)
+    logger.info('Saved to: %s', data_filapath)
 
 
 class Experiment:
@@ -233,7 +242,7 @@ class Experiment:
     data_filapath = os.path.join(save_dir, data_filename)
     with open(data_filapath, 'w') as file:
       json.dump(data, file, indent=4)
-    logging.info('Saved to: %s', data_filapath)
+    logger.info('Saved to: %s', data_filapath)
 
 
 def _parse_gcs_uri(bucket_uri: str) -> tuple[str, str]:
@@ -255,7 +264,7 @@ def _download_files(experiment_dir: str, bucket_uri: str) -> None:
   blobs = bucket.list_blobs(prefix=directory_prefix)
   with ThreadPoolExecutor(max_workers=40) as executor:
     for i, blob in enumerate(blobs):
-      print(f'{i} / {blobs_num}')
+      logger.info('%d / %d', i, blobs_num)
       executor.submit(_download_file, blob, experiment_dir)
 
 
@@ -264,7 +273,7 @@ def _download_file(file_blob: storage.Blob, local_dir: str) -> None:
   Downloads a file from |file_blob| and preserve its path after |bucket_dir|.
   """
   if not file_blob.name:
-    logging.warning('Blob has no name: %s', file_blob)
+    logger.warning('Blob has no name: %s', file_blob)
     return
   if any(
       file_blob.name.endswith(suffix)
@@ -350,7 +359,7 @@ def main() -> int:
   if args.benchmark_dir:
     result = Benchmark(args.benchmark_dir)
     if not result.is_valid_benchmark:
-      logging.info(
+      logger.info(
           'Invalid benchmark directory provided, missing necessary file.')
   elif args.experiment_dir:
     result = Experiment(args.experiment_dir, args.bucket_uri)

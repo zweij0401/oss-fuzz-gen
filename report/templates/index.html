@@ -64,7 +64,7 @@ td .signature {
 
 </style>
 
-<table class="sortable-table">
+<table class="sortable-table" id="benchmark-table">
     <thead>
         <tr>
             <th></th>
@@ -88,7 +88,7 @@ td .signature {
                 </pre>
             </td>
             <td data-sort-value="{{ benchmark.status }}">{{ benchmark.status }}</td>
-            <td data-sort-value={{ benchmark.result.build_success_rate|percent }}>{{ benchmark.result.build_success_rate|percent}}</td>
+            <td data-sort-value="{{ benchmark.result.build_success_rate|percent }}">{{ benchmark.result.build_success_rate|percent}}</td>
             <td data-sort-value="{{ benchmark.result.crash_rate|percent }}"><a href="benchmark/{{ benchmark.id|urlencode }}/crash.json"> {{ benchmark.result.crash_rate|percent }} </a></td>
             <td data-sort-value="{{ benchmark.result.found_bug }}">{{ benchmark.result.found_bug }}</td>
             <td data-sort-value="{{ benchmark.result.max_coverage |percent }}">{{ benchmark.result.max_coverage |percent }}</td>
@@ -98,35 +98,118 @@ td .signature {
     </tbody>
 </table>
 
+<h2>Project summary</h2>
+<table class="sortable-table" id="summary-table">
+    <thead>
+        <tr>
+            <th></th>
+            <th data-sorted="asc">Project</th>
+            <th data-sort-number>Total generated harnesses</th>
+            <th data-sort-number>Total coverage gain</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for project in projects %}
+        <tr>
+            <td class="table-index">{{ loop.index }}</td>
+            <td data-sort-value="{{ project.name }}">{{ project.name }}</td>
+            <td data-sort-value="{{ project.count }}">{{ project.count }}</td>
+            <td data-sort-value="{{ project.coverage_gain|percent }}">{{ project.coverage_gain|percent }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2>Accumulated results</h2>
+<table>
+  <thead>
+    <th>Metric</th>
+    <th>Value</th>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Total sample benchmarks</td>
+      <td>{{ accumulated_results.total_runs }}</td>
+    </tr>
+    <tr>
+      <td>Successful Builds</td>
+      <td>{{ accumulated_results.compiles }}</td>
+    </tr>
+    <tr>
+      <td>Build rate</td>
+      <td>{{ accumulated_results.build_rate |percent }}%</td>
+    </tr>
+    <tr>
+      <td>Average coverage</td>
+      <td>{{ accumulated_results.average_coverage |percent }}%</td>
+    </tr>
+    <tr>
+      <td>Average line coverage diff</td>
+      <td>{{ accumulated_results.average_line_coverage_diff |percent }}%</td>
+    </tr>
+    <tr>
+      <td>Benchmarks with crashes</td>
+      <td>{{ accumulated_results.crashes }}</td>
+    </tr>
+    <tr>
+        <td>Experiment start time</td>
+        <td>{{time_results.start_time}}</td>
+    </tr>
+    <tr>
+        <td>Experiment end time</td>
+        <td>{{time_results.completion_time}}</td>
+    </tr>
+    <tr>
+        <td>Experiment total run time</td>
+        <td>{{time_results.total_run_time}}</td>
+    </tr>
+  </tbody>
+</table>
+
 <script>
 (function() {
-    const headers = Array.from(document.querySelectorAll('table.sortable-table th'));
-    headers.map((th, colindex) => th.addEventListener('click', () => {
-        const sortAsc = th.dataset.sorted != "asc";
-        const sortNumber = th.dataset.sortNumber != undefined;
+    tables = Array.from(document.querySelectorAll('table.sortable-table'));
+    for (let tbl_idx1 = 0; tbl_idx1 < tables.length; tbl_idx1++) {
+        table_element = tables[tbl_idx1];
+        const table_id_name = table_element.id;
+        headers = Array.from(table_element.querySelectorAll('th'));
+        headers.map(
+            (th, colindex) => th.addEventListener('click', () => {
+                const sortAsc = th.dataset.sorted != "asc";
+                const sortNumber = th.dataset.sortNumber != undefined;
 
-        // Move sorted data attribute to the right column
-        headers.map(innerTH => delete innerTH.dataset.sorted);
-        th.dataset.sorted = sortAsc ? "asc" : "desc";
+                // Move sorted data attribute to the right column
+                headers.map(innerTH => delete innerTH.dataset.sorted);
+                th.dataset.sorted = sortAsc ? "asc" : "desc";
 
-        const tbody = document.querySelector('table.sortable-table tbody');
-        const rows = Array.from(tbody.children);
-        rows.sort((a, b) => {
-            let [valueA, valueB] = [a.children[colindex].dataset.sortValue, b.children[colindex].dataset.sortValue];
-            // Swap the values for descending.
-            if (!sortAsc) {
-                [valueB, valueA] = [valueA, valueB];
-            }
+                // Find the relevant table and sort it accordingly.
+                inner_tables = Array.from(document.querySelectorAll('table.sortable-table'));
+                for (let tbl_idx2 = 0; tbl_idx2 < inner_tables.length; tbl_idx2++) {
+                    the_table = inner_tables[tbl_idx2];
+                    if (the_table.id == table_id_name) {
+                        const tbody = the_table.querySelector('tbody');
+                        const rows = Array.from(tbody.children);
+                        rows.sort((a, b) => {
+                            let [valueA, valueB] = [a.children[colindex].dataset.sortValue, b.children[colindex].dataset.sortValue];
+                            // Swap the values for descending.
+                            if (!sortAsc) {
+                                [valueB, valueA] = [valueA, valueB];
+                            }
 
-            if (sortNumber) {
-                return Number(valueB) - Number(valueA);
-            }
-            return valueA.localeCompare(valueB);
-        });
-        tbody.replaceChildren(...rows);
-        // Rewrite the index column
-        rows.map((r, i) => r.children[0].innerText = i+1);
-    }));
+                            if (sortNumber) {
+                                return Number(valueB) - Number(valueA);
+                            }
+                            return valueA.localeCompare(valueB);
+                        });
+                        tbody.replaceChildren(...rows);
+                        // Rewrite the index column
+                        rows.map((r, i) => r.children[0].innerText = i);
+                    }
+                }
+            }, )
+        );
+
+    }
 })();
 </script>
 {% endblock %}

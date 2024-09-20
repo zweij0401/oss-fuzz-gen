@@ -19,6 +19,7 @@ for training.
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -29,6 +30,8 @@ from google.cloud import storage
 
 from data_prep import introspector, project_src
 from experiment import oss_fuzz_checkout
+
+logger = logging.getLogger(__name__)
 
 OSS_FUZZ_EXP_BUCKET = 'oss-fuzz-llm-public'
 # TODO(dongge): Use tmp dir.
@@ -90,10 +93,11 @@ def _bucket_match_target_content_signatures(
   """Returns a list of dictionary with function signatures as keys and
     its fuzz target content as values."""
   if not target_funcs:
-    print('Error: No fuzz target functions available.')
+    logger.info('Error: No fuzz target functions available.')
     return {}
   if not os.path.isdir(fuzz_target_dir):
-    print('Error: Fuzz target directory does not exist ({fuzz_target_dir})')
+    logger.info(
+        'Error: Fuzz target directory does not exist ({fuzz_target_dir})')
     return {}
 
   target_path_contents = _match_target_path_content(list(target_funcs.keys()),
@@ -103,7 +107,7 @@ def _bucket_match_target_content_signatures(
     content = target_path_contents.get(target_path)
     # Some projects' `target_path` is different from the actual
     # path in container, due to relocation in build process.
-    # For example, target_path is /src/hiredis/format_command_fuzzer.c, different
+    # E.g., target_path is /src/hiredis/format_command_fuzzer.c, different
     # from the actual path /src/hiredis/fuzzing/format_command_fuzzer.c in
     # https://storage.googleapis.com/oss-fuzz-introspector/hiredis/inspector-report/20240120/summary.json
     if not content:
@@ -142,12 +146,14 @@ def generate_data(project_name: str,
       target_funcs, project_fuzz_target_dir, project_name)
 
   if target_content_signature_dict:
-    print(f'Downloaded human-written fuzz targets of {project_name} from Google'
-          f' Cloud Bucket: {OSS_FUZZ_EXP_BUCKET}.')
+    logger.info(
+        'Downloaded human-written fuzz targets of %s from Google Cloud Bucket: '
+        '%s', project_name, OSS_FUZZ_EXP_BUCKET)
   else:
-    print(f'Failed to download human-written fuzz target of {project_name} '
-          f'from Google Cloud Bucket: {OSS_FUZZ_EXP_BUCKET}.')
-    print('Will try to build from Google Cloud or local docker image.')
+    logger.info(
+        'Failed to download human-written fuzz target of %s from Google Cloud '
+        'Bucket: %s.', project_name, OSS_FUZZ_EXP_BUCKET)
+    logger.info('Will try to build from Google Cloud or local docker image.')
     target_content_signature_dict = _match_target_content_signatures(
         target_funcs, project_name, language, cloud_experiment_bucket)
   if not target_content_signature_dict:
@@ -168,17 +174,21 @@ def generate_data(project_name: str,
 
 def _remove_header_comments(code: str) -> str:
   """Removes comments and empty lines in the code."""
-  # Remove single-line comments.
-  single_line_comment = re.compile(r'//.*?\n')
-  code = re.sub(single_line_comment, '\n', code)
-
   # Remove multi-line comments.
   multi_line_comment = re.compile(r'/\*.*?\*/', re.DOTALL)
   code = re.sub(multi_line_comment, '', code)
 
+  # Remove single-line comments.
+  single_line_comment = re.compile(r'(?:^|\s+)//.*\n')
+  code = re.sub(single_line_comment, '\n', code)
+
   # Remove empty lines.
   empty_line = re.compile(r'\n+\s*\n+')
   code = re.sub(empty_line, '\n', code)
+
+  # Trim all newlines and spaces.
+  code.lstrip('\n ')
+  code.rstrip('\n ')
   return code
 
 
@@ -206,7 +216,7 @@ def _match_target_content_signatures(
   """Returns a list of dictionary with function signatures as keys and
     its fuzz target content as values."""
   if not target_funcs:
-    print('Error: No fuzz target functions available.')
+    logger.info('Error: No fuzz target functions available.')
     return {}
 
   source_content = project_src.search_source(
@@ -215,7 +225,7 @@ def _match_target_content_signatures(
       cloud_experiment_bucket=cloud_experiment_bucket)
 
   if not source_content[0]:
-    print(f'Error: No fuzz target found for project {project_name}.')
+    logger.info('Error: No fuzz target found for project %s', project_name)
     return {}
 
   target_path_contents = source_content[0]
@@ -225,7 +235,7 @@ def _match_target_content_signatures(
     content = target_path_contents.get(target_path)
     # Some projects' `target_path` is different from the actual
     # path in container, due to relocation in build process.
-    # For example, target_path is /src/hiredis/format_command_fuzzer.c, different
+    # E.g., target_path is /src/hiredis/format_command_fuzzer.c,
     # from the actual path /src/hiredis/fuzzing/format_command_fuzzer.c in
     # https://storage.googleapis.com/oss-fuzz-introspector/hiredis/inspector-report/20240120/summary.json
     if not content:
@@ -322,7 +332,7 @@ def _generate_project_training_data(project_name: str,
     return generate_data(project_name, language, sig_per_target, max_samples,
                          cloud_experiment_bucket)
   except Exception as e:
-    print(f'Project {project_name} failed:\n{e}')
+    logger.info('Project %s failed:\n%s', project_name, e)
     return None
 
 

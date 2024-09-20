@@ -33,14 +33,24 @@ from string import Template
 logging.basicConfig(level=logging.INFO)
 
 DEFAULT_CLUSTER = 'llm-experiment'
+LARGE_CLUSTER = 'llm-experiment-large'
 DEFAULT_LOCATION = 'us-central1-c'
+LARGE_LOCATION = 'us-central1'
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), 'k8s', 'pr-exp.yaml')
+LARGE_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), 'k8s',
+                                   'large-pr-exp.yaml')
 BENCHMARK_SET = 'comparison'
-LLM_NAME = 'vertex_ai_code-bison-32k'
+LLM_NAME = 'vertex_ai_gemini-1-5'
+LLM_CHAT_NAME = 'vertex_ai_gemini-1-5-chat'
 EXP_DELAY = 0
 FUZZING_TIMEOUT = 300
 REQUEST_CPU = 6
+LARGE_REQUEST_CPU = 356
 REQUEST_MEM = 30
+LARGE_REQUEST_MEM = 1000
+NUM_SAMPLES = 2
+NUM_FIXES = 2
+VARY_TEMPERATURE = True
 
 PR_LINK_PREFIX = 'https://github.com/google/oss-fuzz-gen/pull'
 JOB_LINK_PREFIX = ('https://console.cloud.google.com/kubernetes/job/'
@@ -108,11 +118,6 @@ def _parse_args(cmd) -> argparse.Namespace:
       help=('Delay each benchmark experiment by N seconds, default: '
             f'{EXP_DELAY}.'))
   parser.add_argument(
-      '-f',
-      '--force',
-      action='store_true',
-      help='Remove existing GKE job and bucket before creating new ones.')
-  parser.add_argument(
       '-to',
       '--fuzzing-timeout',
       type=int,
@@ -130,6 +135,41 @@ def _parse_args(cmd) -> argparse.Namespace:
       type=int,
       default=REQUEST_MEM,
       help=f'Memory requested for experiment in Gi, default: {REQUEST_MEM} Gi.')
+  parser.add_argument(
+      '-i',
+      '--local-introspector',
+      action='store_true',
+      help='If set will use a local version of fuzz introspector\'s webapp')
+  parser.add_argument(
+      '-ns',
+      '--num-samples',
+      type=int,
+      default=NUM_SAMPLES,
+      help=f'The number of samples to request from LLM, default: {NUM_SAMPLES}')
+  parser.add_argument(
+      '-nf',
+      '--llm-fix-limit',
+      type=int,
+      default=NUM_FIXES,
+      help=f'The number of fixes to request from LLM, default: {NUM_FIXES}')
+  parser.add_argument(
+      '-vt',
+      '--vary-temperature',
+      type=bool,
+      default=VARY_TEMPERATURE,
+      help=('Use different temperatures for each sample, default: '
+            f'{VARY_TEMPERATURE}'))
+  parser.add_argument('-ag',
+                      '--agent',
+                      action='store_true',
+                      default=False,
+                      help='Enables agent enhancement.')
+  parser.add_argument('-lg',
+                      '--large',
+                      action='store_true',
+                      default=False,
+                      help=('(Use sparingly) Do a large experiment with '
+                            'many more cores available.'))
   args = parser.parse_args(cmd)
 
   assert os.path.isfile(
@@ -139,6 +179,17 @@ def _parse_args(cmd) -> argparse.Namespace:
   args.experiment_name = f'{args.pr_id}'
   if args.name_suffix:
     args.experiment_name = f'{args.experiment_name}-{args.name_suffix}'
+
+  # Use Chat model by default in agent-enhance experiments.
+  if args.agent and args.llm == LLM_NAME:
+    args.llm = LLM_CHAT_NAME
+
+  if args.large:
+    args.location = LARGE_LOCATION
+    args.cluster = LARGE_CLUSTER
+    args.request_cpus = LARGE_REQUEST_CPU
+    args.request_memory = LARGE_REQUEST_MEM
+    args.gke_template = LARGE_TEMPLATE_PATH
 
   return args
 
@@ -205,9 +256,8 @@ def _prepare_experiment_info(args: argparse.Namespace) -> tuple[str, str, str]:
       f'{BUCKET_GS_LINK_PREFIX}/{datetime.now().strftime("%Y-%m-%d")}-'
       f'{args.pr_id}-{args.name_suffix}-{args.benchmark_set}')
 
-  if args.force:
-    logging.info(
-        'FORCE mode enable, will first remove existing GKE job and bucket.')
+  logging.info(
+      'FORCE mode enable, will first remove existing GKE job and bucket.')
 
   logging.info(
       'Requesting a GKE experiment named %s:\nPR: %s\nJOB: %s\nREPORT: %s\n'
@@ -250,6 +300,12 @@ def _fill_template(args: argparse.Namespace) -> str:
   exp_env_vars['GKE_EXP_NAME'] = args.experiment_name
   exp_env_vars['GKE_EXP_REQ_CPU'] = args.request_cpus
   exp_env_vars['GKE_EXP_REQ_MEM'] = f'{args.request_memory}Gi'
+  if args.local_introspector:
+    exp_env_vars['GKE_EXP_LOCAL_INTROSPECTOR'] = 'true'
+  exp_env_vars['GKE_EXP_NUM_SAMPLES'] = f'{args.num_samples}'
+  exp_env_vars['GKE_EXP_LLM_FIX_LIMIT'] = f'{args.llm_fix_limit}'
+  exp_env_vars['GKE_EXP_VARY_TEMPERATURE'] = f'{args.vary_temperature}'.lower()
+  exp_env_vars['GKE_EXP_AGENT'] = f'{args.agent}'.lower()
 
   with open(args.gke_template, 'r') as file:
     yaml_template = file.read()
@@ -273,8 +329,7 @@ def main(cmd=None):
   args = _parse_args(cmd)
   gke_job_name, bucket_link, bucket_gs_link = _prepare_experiment_info(args)
   _get_gke_credential(args)
-  if args.force:
-    _remove_existing_job_bucket(gke_job_name, bucket_link, bucket_gs_link)
+  _remove_existing_job_bucket(gke_job_name, bucket_link, bucket_gs_link)
   _request_experiment(_fill_template(args))
 
 

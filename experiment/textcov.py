@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import re
 import subprocess
@@ -23,6 +24,8 @@ import xml.etree.ElementTree as ET
 from typing import BinaryIO, List, Optional
 
 import chardet
+
+logger = logging.getLogger(__name__)
 
 # No spaces at the beginning, and ends with a ":".
 FUNCTION_PATTERN = re.compile(r'^([^\s].*):$')
@@ -40,8 +43,7 @@ JVM_CLASS_MAPPING = {
 }
 
 JVM_SKIPPED_METHOD = [
-    '<init>', '<cinit>', 'fuzzerTestOneInput', 'fuzzerInitialize',
-    'fuzzerTearDown'
+    'fuzzerTestOneInput', 'fuzzerInitialize', 'fuzzerTearDown'
 ]
 
 
@@ -125,15 +127,10 @@ class Function:
     """Subtract covered lines."""
 
     if language == 'jvm':
-      total_line = len(self.lines)
-      self.lines = {}
-      new_covered_lines = other.covered_lines - self.covered_lines
-      for i in range(total_line):
-        line = f'Line{i}'
-        if i >= new_covered_lines:
-          self.lines[line] = Line(contents=line, hit_count=0)
-        else:
-          self.lines[line] = Line(contents=line, hit_count=1)
+      for line_no, line in self.lines.items():
+        other_line = other.lines.get(line_no)
+        if other_line and other_line.hit_count > 0:
+          line.hit_count = 0
     else:
       # For our analysis purposes, we completely delete any lines that are
       # hit by the other, rather than subtracting hitcounts.
@@ -143,10 +140,43 @@ class Function:
 
 
 @dataclasses.dataclass
+class File:
+  """Represents a file in a textcov, only for Python."""
+  name: str = ''
+  # Line contents -> Line object. We key on line contents to account for
+  # potential line number movements.
+  lines: dict[str, Line] = dataclasses.field(default_factory=dict)
+
+  def merge(self, other: File):
+    for line in other.lines.values():
+      if line.contents in self.lines:
+        self.lines[line.contents].hit_count += line.hit_count
+      else:
+        self.lines[line.contents] = Line(contents=line.contents,
+                                         hit_count=line.hit_count)
+
+  @property
+  def covered_lines(self):
+    return sum(1 for l in self.lines.values() if l.hit_count > 0)
+
+  def subtract_covered_lines(self, other: File):
+    """Subtract covered lines."""
+
+    for line_no, line in self.lines.items():
+      other_line = other.lines.get(line_no)
+      if other_line and other_line.hit_count > 0:
+        self.lines[line_no].hit_count = 0
+
+
+@dataclasses.dataclass
 class Textcov:
   """Textcov."""
   # Function name -> Function object.
+  # For JVM / C / C++
   functions: dict[str, Function] = dataclasses.field(default_factory=dict)
+  # File name -> File object.
+  # For Python
+  files: dict[str, File] = dataclasses.field(default_factory=dict)
   language: str = 'c++'
 
   @classmethod
@@ -166,7 +196,7 @@ class Textcov:
       result = chardet.detect(raw_data)
       encoding = result['encoding']
       if encoding is None:
-        logging.warning('Failed to decode.')
+        logger.warning('Failed to decode.')
         raise UnicodeDecodeError("chardet", raw_data, 0, len(raw_data),
                                  "Cannot detect encoding")
 
@@ -190,7 +220,7 @@ class Textcov:
     try:
       demangled = demangle(cls._read_file_with_fallback(file_handle))
     except Exception as e:
-      logging.warning('Decoding failure: %s', e)
+      logger.warning('Decoding failure: %s', e)
       demangled = ''
     demangled = _discard_fuzz_target_lines(demangled)
 
@@ -234,12 +264,55 @@ class Textcov:
     return textcov
 
   @classmethod
+  def from_python_file(cls, file_handle) -> Textcov:
+    """Read a textcov from a all_cov.json file for python."""
+    textcov = cls()
+    textcov.language = 'python'
+    coverage_report = json.load(file_handle)
+
+    # Process coverage report file by file
+    for file, data in coverage_report.get('files', {}).items():
+      # Retrieve pure file and directory name
+      filename = file.replace('/pythoncovmergedfiles/medio/medio/', '')
+      filename = filename.split('site-packages/', 1)[-1]
+      current_file = File(name=filename)
+
+      # Process line coverage information
+      covered_lines = data.get('executed_lines', [])
+      missed_lines = data.get('missing_lines', [])
+      for line_no in covered_lines:
+        line = f'Line{line_no}'
+        current_file.lines[line] = Line(contents=line, hit_count=1)
+      for line_no in missed_lines:
+        line = f'Line{line_no}'
+        current_file.lines[line] = Line(contents=line, hit_count=0)
+
+      textcov.files[filename] = current_file
+
+    return textcov
+
+  @classmethod
   def from_jvm_file(cls, file_handle) -> Textcov:
     """Read a textcov from a jacoco.xml file."""
     textcov = cls()
     textcov.language = 'jvm'
     jacoco_report = ET.parse(file_handle)
 
+    # Process source file information
+    line_coverage_dict = {}
+    for item in jacoco_report.iter():
+      if item.tag == 'sourcefile':
+        line_coverage = []
+        for line_item in item:
+          if line_item.tag == 'line':
+            line_no = int(line_item.attrib['nr'])
+            if line_item.attrib['mi'] == '0':
+              line_coverage.append((line_no, True))
+            else:
+              line_coverage.append((line_no, False))
+        line_coverage_dict[item.attrib['name']] = line_coverage
+
+    # Process methods
     class_method_items = []
     for item in jacoco_report.iter():
       if item.tag == 'class':
@@ -247,19 +320,39 @@ class Textcov:
         if textcov.is_fuzzer_class(item):
           continue
 
+        # Get line coverage information for this class
+        sourcefilename = item.attrib.get('sourcefilename')
+        if not sourcefilename:
+          # Fail safe for invalid jacoco.xml with no sourcefilename
+          continue
+        coverage = line_coverage_dict.get(sourcefilename, [])
+
         # Get class name and skip fuzzing and testing classes
-        class_name = item.attrib['name'].replace('/', '.')
-        if 'test' in class_name.lower() or 'fuzzer' in class_name.lower():
+        class_name = item.attrib.get('name', '').replace('/', '.')
+        if not class_name or 'test' in class_name.lower(
+        ) or 'fuzzer' in class_name.lower():
           continue
 
         for method_item in item:
           if method_item.tag == 'method':
             if method_item.attrib['name'] not in JVM_SKIPPED_METHOD:
-              class_method_items.append((class_name, method_item))
+              class_method_items.append((class_name, method_item, coverage))
 
-    for class_name, method_item in class_method_items:
+    for class_name, method_item, coverage in class_method_items:
       method_dict = method_item.attrib
       method_name = method_dict['name']
+
+      # Determine start index in coverage list
+      start_line = int(method_dict.get('line', '-1'))
+      start_index = -1
+      for count, item in enumerate(coverage):
+        if item[0] == start_line:
+          start_index = count
+          break
+
+      # Failed to retrieve coverage information, skipping this method
+      if start_index == -1:
+        continue
 
       # Process all arguments type from shortern Java Class naming
       args = textcov.determine_jvm_arguments_type(method_dict['desc'])
@@ -270,27 +363,36 @@ class Textcov:
 
       # Retrieve line coverage information
       total_line = 0
-      covered_line = 0
       for cov_data in method_item:
         if cov_data.attrib['type'] == 'LINE':
-          covered_line = int(cov_data.attrib['covered'])
           total_line = int(cov_data.attrib['covered']) + int(
               cov_data.attrib['missed'])
-      for i in range(total_line):
-        line = f'Line{i}'
-        if i >= covered_line:
-          current_method.lines[line] = Line(contents=line, hit_count=0)
-        else:
+
+      for count in range(start_index, start_index + total_line):
+        if count >= len(coverage):
+          # Fail safe
+          break
+        line_no, is_reached = coverage[count]
+        line = f'Line{line_no}'
+        if is_reached:
           current_method.lines[line] = Line(contents=line, hit_count=1)
+        else:
+          current_method.lines[line] = Line(contents=line, hit_count=0)
 
       textcov.functions[full_method_name] = current_method
 
     return textcov
 
   def to_file(self, filename: str) -> None:
-    """Writes covered functions and lines to |filename|."""
+    """Writes covered functions/files and lines to |filename|."""
     file_content = ''
-    for func_obj in self.functions.values():
+
+    if self.language == 'python':
+      target = self.files
+    else:
+      target = self.functions
+
+    for func_obj in target.values():
       for line_content, line_obj in func_obj.lines.items():
         file_content += f'{line_content}\n' if line_obj.hit_count else ''
 
@@ -299,24 +401,47 @@ class Textcov:
 
   def merge(self, other: Textcov):
     """Merge another textcov"""
-    for function in other.functions.values():
-      if function.name not in self.functions:
-        self.functions[function.name] = Function(name=function.name)
-      self.functions[function.name].merge(function)
+    # The default language for Textcov is set to c++
+    # This logic fixes the language of Textcov object when
+    # merging an existing Textcov with different language
+    if self.language != other.language and self.language == 'c++':
+      self.language = other.language
+
+    if self.language == 'python':
+      for file in other.files.values():
+        if file.name not in self.files:
+          self.files[file.name] = File(name=file.name)
+        self.files[file.name].merge(file)
+    else:
+      for function in other.functions.values():
+        if function.name not in self.functions:
+          self.functions[function.name] = Function(name=function.name)
+        self.functions[function.name].merge(function)
 
   def subtract_covered_lines(self, other: Textcov):
     """Diff another textcov"""
-    for function in other.functions.values():
-      if function.name in self.functions:
-        self.functions[function.name].subtract_covered_lines(
-            function, self.language)
+    if self.language == 'python':
+      for file in other.files.values():
+        if file.name in self.files:
+          self.files[file.name].subtract_covered_lines(file)
+    else:
+      for function in other.functions.values():
+        if function.name in self.functions:
+          self.functions[function.name].subtract_covered_lines(
+              function, self.language)
 
   @property
   def covered_lines(self):
+    if self.language == 'python':
+      return sum(f.covered_lines for f in self.files.values())
+
     return sum(f.covered_lines for f in self.functions.values())
 
   @property
   def total_lines(self):
+    if self.language == 'python':
+      return sum(len(f.lines) for f in self.files.values())
+
     return sum(len(f.lines) for f in self.functions.values())
 
   def is_fuzzer_class(self, class_item) -> bool:
@@ -348,6 +473,7 @@ class Textcov:
     arg = ''
     start = False
     next_arg = ''
+    array_count = 0
     for c in desc:
       if c == '(':
         continue
@@ -363,16 +489,23 @@ class Textcov:
       else:
         if c == 'L':
           start = True
-          args.append(next_arg)
+          if next_arg:
+            next_arg += '[]' * array_count
+            array_count = 0
+            args.append(next_arg)
           arg = ''
           next_arg = ''
-        elif c in ['[', ']']:
-          next_arg = next_arg + c
+        elif c == '[':
+          array_count += 1
         else:
           if c in JVM_CLASS_MAPPING:
-            args.append(next_arg)
+            if next_arg:
+              next_arg += '[]' * array_count
+              array_count = 0
+              args.append(next_arg)
             next_arg = JVM_CLASS_MAPPING[c]
 
     if next_arg:
+      next_arg += '[]' * array_count
       args.append(next_arg)
     return args
