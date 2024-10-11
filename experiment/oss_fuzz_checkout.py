@@ -189,7 +189,10 @@ def _get_project_cache_name(project: str) -> str:
 def _get_project_cache_image_name(project: str, sanitizer: str) -> str:
   """Gets name of cached Docker image for a project and a respective
   sanitizer."""
-  return f'gcr.io/oss-fuzz/{project}_{sanitizer}_cache'
+  sanitizer_mapping = {'address': 'asan', 'coverage': 'cov'}
+  san_lookup = sanitizer_mapping[sanitizer]
+  return ('us-central1-docker.pkg.dev/oss-fuzz/oss-fuzz-gen/'
+          f'{project}-ofg-cached-{san_lookup}')
 
 
 def _has_cache_build_script(project: str) -> bool:
@@ -217,7 +220,24 @@ def _prepare_image_cache(project: str) -> bool:
       logger.info('%s::%s is already cached, reusing existing cache.', project,
                   sanitizer)
       continue
-    # Create cached image by building using OSS-Fuzz with set variable
+
+    # Pull the cache first
+    pull_cmd = [
+        'docker', 'pull',
+        _get_project_cache_image_name(project, sanitizer)
+    ]
+    try:
+      sp.run(pull_cmd, check=True)
+      logger.info('Successfully pulled cache image for %s', project)
+    except sp.CalledProcessError:
+      logger.info('Failed pulling image for %s', project)
+
+    if is_image_cached(project, sanitizer):
+      logger.info('pulled image for %s::%s', project, sanitizer)
+      continue
+
+    # If pull did not work, create cached image by building using OSS-Fuzz
+    # with set variable. Fail if this does not work.
     command = [
         'python3', 'infra/helper.py', 'build_fuzzers', project, '--sanitizer',
         sanitizer

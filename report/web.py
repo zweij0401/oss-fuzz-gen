@@ -120,8 +120,13 @@ class GenerateReport:
     for l in os.listdir(coverage_path):
       if l.split('.')[0] == sample.id:
         coverage_report = os.path.join(coverage_path, l)
+
+    # On cloud runs there are two folders in code coverage reports, (report,
+    # textcov). If we have three files/dirs (linux, style.cssand textcov), then
+    # it's a local run. In that case copy over the code coverage reports so
+    # they are visible in the HTML page.
     if coverage_report and os.path.isdir(coverage_report) and len(
-        os.listdir(coverage_report)) > 1:
+        os.listdir(coverage_report)) > 2:
       # Copy coverage to reports out
       dst = os.path.join(self._output_dir, 'sample', benchmark.id, 'coverage')
       os.makedirs(dst, exist_ok=True)
@@ -134,6 +139,7 @@ class GenerateReport:
   def generate(self):
     """Generate and write every report file."""
     benchmarks = []
+    samples_with_bugs = []
     for benchmark_id in self._results.list_benchmark_ids():
       results, targets = self._results.get_results(benchmark_id)
       benchmark = self._results.match_benchmark(benchmark_id, results, targets)
@@ -149,6 +155,8 @@ class GenerateReport:
       self._write_benchmark_crash(benchmark, samples)
 
       for sample in samples:
+        if sample.result.crashes:
+          samples_with_bugs.append({'benchmark': benchmark, 'sample': sample})
         sample_targets = self._results.get_targets(benchmark.id, sample.id)
         self._write_benchmark_sample(benchmark, sample, sample_targets)
 
@@ -158,7 +166,7 @@ class GenerateReport:
     time_results = self.read_timings()
 
     self._write_index_html(benchmarks, accumulated_results, time_results,
-                           projects)
+                           projects, samples_with_bugs)
     self._write_index_json(benchmarks)
 
   def _write(self, output_path: str, content: str):
@@ -178,13 +186,15 @@ class GenerateReport:
 
   def _write_index_html(self, benchmarks: List[Benchmark],
                         accumulated_results: AccumulatedResult,
-                        time_results: dict[str, Any], projects: list[Project]):
+                        time_results: dict[str, Any], projects: list[Project],
+                        samples_with_bugs: list[dict[str, Any]]):
     """Generate the report index.html and write to filesystem."""
     rendered = self._jinja.render('index.html',
                                   benchmarks=benchmarks,
                                   accumulated_results=accumulated_results,
                                   time_results=time_results,
-                                  projects=projects)
+                                  projects=projects,
+                                  samples_with_bugs=samples_with_bugs)
     self._write('index.html', rendered)
 
   def _write_index_json(self, benchmarks: List[Benchmark]):

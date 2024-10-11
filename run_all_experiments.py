@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 import traceback
@@ -103,7 +104,7 @@ def generate_benchmarks(args: argparse.Namespace) -> None:
     benchmarks = introspector.populate_benchmarks_using_introspector(
         project, project_lang, args.generate_benchmarks_max, benchmark_oracles)
     if benchmarks:
-      benchmarklib.Benchmark.to_yaml(benchmarks, benchmark_dir)
+      benchmarklib.Benchmark.to_yaml(benchmarks, outdir=benchmark_dir)
 
 
 def prepare_experiment_targets(
@@ -132,8 +133,7 @@ def prepare_experiment_targets(
   return experiment_configs
 
 
-def run_experiments(benchmark: benchmarklib.Benchmark,
-                    args: argparse.Namespace) -> Result:
+def run_experiments(benchmark: benchmarklib.Benchmark, args) -> Result:
   """Runs an experiment based on the |benchmark| config."""
   try:
     work_dirs = WorkDirs(os.path.join(args.work_dir, f'output-{benchmark.id}'))
@@ -314,7 +314,7 @@ def _print_and_dump_experiment_result(result: Result):
   # Process total gain from all generated harnesses for each projects and
   # update summary report. This makes it possible to view per-project stats
   # as experiments complete rather than only after all experiments run.
-  coverage_gain_dict = _process_total_coverage_gain(EXPERIMENT_RESULTS)
+  coverage_gain_dict = _process_total_coverage_gain()
   add_to_json_report(WORK_DIR, 'project_summary', coverage_gain_dict)
 
 
@@ -363,30 +363,73 @@ def add_to_json_report(outdir: str, key: str, value: Any) -> None:
     f.write(json.dumps(json_report))
 
 
-def _process_total_coverage_gain(
-    results: list[Result]) -> dict[str, dict[str, Any]]:
+def _process_total_coverage_gain() -> dict[str, dict[str, Any]]:
   """Processes and calculates the total coverage gain for each project."""
   textcov_dict: dict[str, list[textcov.Textcov]] = {}
-  if not results:
+
+  # Load all the textcov dirs
+  for benchmark_dir in os.listdir(WORK_DIR):
+    if not os.path.isdir(os.path.join(WORK_DIR, benchmark_dir)):
+      continue
+
+    result_benchmark_used_path = os.path.join(
+        os.path.join(WORK_DIR, benchmark_dir, 'benchmark.yaml'))
+    if not os.path.isfile(result_benchmark_used_path):
+      continue
+
+    project_name = ''
+    ignore_patterns = []
+
+    benchmark_used = benchmarklib.Benchmark.from_yaml(
+        result_benchmark_used_path)
+    if not benchmark_used:
+      logger.info('Did not find benchmark for %s', benchmark_dir)
+      try:
+        project_name = '-'.join(benchmark_dir.split('-')[1:-1])
+      except:
+        continue
+    else:
+      logger.info('Found benchmark for %s', benchmark_dir)
+      project_name = benchmark_used[0].project
+      target_basename = os.path.basename(benchmark_used[0].target_path)
+      ignore_patterns = [re.compile(r'^' + re.escape(target_basename) + ':')]
+
+    coverage_reports = os.path.join(WORK_DIR, benchmark_dir,
+                                    'code-coverage-reports')
+    if not os.path.isdir(coverage_reports):
+      continue
+
+    if project_name not in textcov_dict:
+      textcov_dict[project_name] = []
+    for sample in os.listdir(coverage_reports):
+      summary = os.path.join(coverage_reports, sample, 'textcov')
+      if not os.path.isdir(summary):
+        continue
+
+      for textcov_file in os.listdir(summary):
+        if textcov_file.endswith('.covreport'):
+          with open(os.path.join(summary, textcov_file), 'rb') as f:
+
+            textcov_dict[project_name].append(
+                textcov.Textcov.from_file(
+                    f, ignore_function_patterns=ignore_patterns))
+        elif textcov_file == 'all_cov.json':
+          with open(os.path.join(summary, textcov_file)) as f:
+            textcov_dict[project_name].append(
+                textcov.Textcov.from_python_file(f))
+        elif textcov_file == 'jacoco.xml':
+          with open(os.path.join(summary, textcov_file)) as f:
+            textcov_dict[project_name].append(textcov.Textcov.from_jvm_file(f))
+
+  if not textcov_dict:
     return {}
-  for result in results:
-    # TODO(dongge): Do not use a hacky string for result.result when an
-    # exception happened during experiments?
-    if not isinstance(result.result, run_one_experiment.AggregatedResult):
-      continue
-    cov = result.result.full_textcov_diff
-    if not cov:
-      continue
-    if result.benchmark.project not in textcov_dict:
-      textcov_dict[result.benchmark.project] = []
-    textcov_dict[result.benchmark.project].append(cov)
 
   coverage_gain: dict[str, dict[str, Any]] = {}
   for project, cov_list in textcov_dict.items():
     total_cov = textcov.Textcov()
     for cov in cov_list:
       total_cov.merge(cov)
-
+    existing_textcov = evaluator.load_existing_textcov(project)
     coverage_summary = evaluator.load_existing_coverage_summary(project)
 
     try:
@@ -395,11 +438,24 @@ def _process_total_coverage_gain(
     except (KeyError, TypeError):
       lines = []
 
-    total_lines = max(total_cov.total_lines, sum(lines))
+    total_existing_lines = sum(lines)
+    total_cov_covered_lines_before_subtraction = total_cov.covered_lines
+    total_cov.subtract_covered_lines(existing_textcov)
+
+    total_lines = max(total_cov.total_lines, total_existing_lines)
 
     if total_lines:
       coverage_gain[project] = {
-          'coverage_diff': total_cov.covered_lines / total_lines
+          'coverage_diff':
+              total_cov.covered_lines / total_lines,
+          'coverage_ofg_total_covered_lines':
+              total_cov_covered_lines_before_subtraction,
+          'coverage_ofg_total_new_covered_lines':
+              total_cov.covered_lines,
+          'coverage_existing_total_covered_lines':
+              existing_textcov.covered_lines,
+          'coverage_existing_total_lines':
+              total_existing_lines,
       }
     else:
       # Fail safe when total_lines is 0 because of invalid coverage report
@@ -458,7 +514,7 @@ def main():
       p.join()
 
   # Process total gain from all generated harnesses for each projects
-  coverage_gain_dict = _process_total_coverage_gain(EXPERIMENT_RESULTS)
+  coverage_gain_dict = _process_total_coverage_gain()
   add_to_json_report(args.work_dir, 'project_summary', coverage_gain_dict)
 
   # Capture time at end
